@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -e
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+# Активировать venv, если существует
+if [ -f "venv/bin/activate" ]; then
+    source venv/bin/activate
+fi
+
+echo ">>> [pre-commit] isort: сортировка импортов..."
+python3 -m isort src
+
+echo ">>> [pre-commit] black: форматирование кода..."
+python3 -m black src
+
+echo ">>> [pre-commit] Переиндексация изменённых файлов..."
+git add -u src
+
+echo ">>> [pre-commit] mypy: проверка типов..."
+python3 -m mypy src
+
+echo ">>> [pre-commit] Все проверки прошли успешно."

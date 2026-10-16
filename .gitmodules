@@ -1,0 +1,3 @@
+[submodule "train-ticket"]
+	path = train-ticket
+	url = https://github.com/FudanSELab/train-ticket.git

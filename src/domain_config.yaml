@@ -1,0 +1,328 @@
+# domain_config.yaml — единая точка хранения доменных констант.
+#
+# Все значения здесь — переносимые дефолты для train-ticket.
+# Для нового репозитория/фреймворка — создать свой domain_config.yaml
+# (или расширить этот) рядом с predict.py/src/.
+#
+# Все regex-паттерны в single-quoted YAML строках: backslash сохраняется буквально
+# (YAML single-quote: только '' экранирует апостроф).
+
+# ---------------------------------------------------------------------------
+# Именование сервисов
+# ---------------------------------------------------------------------------
+service_naming:
+  prefix: "ts-"
+  suffix: "-service"
+
+# ---------------------------------------------------------------------------
+# Директории, исключённые при обходе репозитория (walker.py)
+#
+# Список дополняется динамически из .gitignore анализируемого репозитория.
+# Здесь: директории, специфичные для build-систем и IDE (которых нет в .gitignore),
+# или универсальные runtime/cache директории.
+# ---------------------------------------------------------------------------
+excluded_dirs:
+  - target          # Maven/Gradle build output
+  - old-docs        # устаревшая документация
+  - .mvn            # Maven wrapper
+  - build           # Generic build dir
+  - .idea           # IntelliJ IDE
+  - dist            # JavaScript dist
+  - .gradle         # Gradle cache
+  - test-output     # TestNG output
+  - .cache          # Generic cache
+  - charts          # Helm-чарты ({{ }} синтаксис невалиден для PyYAML)
+  - node_modules    # npm packages
+  - __pycache__     # Python bytecode
+  - venv            # Python virtual env
+  - .git            # Git metadata
+
+# ---------------------------------------------------------------------------
+# Функциональные суффиксы сиблинг-вариантов сервисов (siblings.py)
+# ts-route-plan-service ↔ ts-route-service
+# ---------------------------------------------------------------------------
+func_variant_suffixes:
+  - plan
+  - price
+  - delivery
+  - map
+  - info
+  - basic
+  - payment
+  - query
+
+# ---------------------------------------------------------------------------
+# Token Taxonomy — классификация токенов имён сервисов (service_classifier.py)
+# ---------------------------------------------------------------------------
+
+# Tier 2: архитектурные роли — фильтруются при авто-извлечении Tier 3 (P-93)
+# Tier 3 (доменные) авто-извлекается из имён сервисов скелета: не хардкодится.
+tier2_arch_tokens:
+  - service        # суффикс, остаётся если не полностью убрался _svc_strip
+  - controller
+  - dto
+  - repository
+  - impl
+  - api
+  - server
+  - client
+  - handler
+  - manager
+  - factory
+  - helper
+  - util
+  - utils
+
+# Tier 4 Remote: инфра-токены для фильтра remote edges (широкий набор)
+tier4_remote_tokens:
+  - auth
+  - authentication
+  - authorize
+  - authorization
+  - verify
+  - verification
+  - jwt
+  - token
+  - credential
+  - password
+  - secret
+  - captcha
+  - user
+  - account
+  # "security" намеренно исключён: ts-security-service — конфигурационный сервис
+
+# Tier 4 Executes: строгий набор только для фильтра executes
+tier4_executes_tokens:
+  - verify
+  - verification
+  - code   # "verification-code" паттерн
+  - captcha
+
+# ---------------------------------------------------------------------------
+# Паттерны типа поезда — step_typer.py
+#
+# ВНИМАНИЕ: DongChe здесь относится к G-диапазону для BM25-disambiguation.
+# В oracle.py DongChe трактуется как D-тип для точного pruning (разные роли!).
+# ---------------------------------------------------------------------------
+step_train_patterns:
+  G:
+    - 'high.?speed'
+    - 'gaotie'
+    - 'gao.?tie'
+    - 'g.?train'
+    - 'g-?\s*type'
+    - 'dongche'
+    - 'dong.?che'
+    - 'd.?train'
+    - 'd-?\s*type'
+    - 'crh'
+    - 'bullet'
+  OTHER:
+    - 'regular'
+    - "'?other'?\\s*type"
+    - 'non.?high.?speed'
+    - 'slow'
+    - 'normal\s+train'
+
+# ---------------------------------------------------------------------------
+# Паттерны типа поезда — oracle.py
+#
+# ВНИМАНИЕ: DongChe здесь D-тип (для точного pruning по BFS ветвям).
+# NOT_G имеет приоритет над G (предотвращает false positive "not high-speed").
+# ---------------------------------------------------------------------------
+oracle_train_patterns:
+  G:
+    - 'high.?speed'
+    - 'g.train'
+    - 'g-?\s*type'
+    - 'gaotie'
+    - 'gao.?tie'
+  D:
+    - 'd.train'
+    - 'd-?\s*type'
+    - 'dongche'
+    - 'dong.?che'
+  NOT_G:
+    - 'not\s+high.?speed'
+    - 'regular\s+train'
+    - 'other\b.{0,30}\btype'
+
+# security_di удалён: DI-контракты (loadUserByUsername, UserDetails callbacks и др.)
+# авто-обнаруживаются из скелета в src/trace/closure.py через implements_raw + @Override.
+
+# ---------------------------------------------------------------------------
+# Правила классификации шагов сценария (step_typer.py)
+#
+# Порядок важен: первый match выигрывает.
+# Дублирование type (query_orders дважды) намеренно — дополнительный вариант.
+# ---------------------------------------------------------------------------
+step_rules:
+  # Консигнация выше register (иначе "registered on the account" → register)
+  - type: query_consign
+    patterns:
+      - 'look up.*consign'
+      - 'look up.*luggage'
+      - 'consignment record'
+      - 'luggage consignment.*registered'
+      - 'check what.*consign'
+      - 'list of.*consign'
+
+  # Только отдельный шаг добавления консигнации (не при бронировании)
+  - type: add_consign
+    patterns:
+      - '^add.*consign'
+      - '^register.*consign'
+
+  # Только явная команда "register" в начале (не причастие "registered on")
+  - type: register
+    patterns:
+      - '^register\b'
+      - 'sign up'
+      - 'create account'
+      - '\bnew account\b'
+      - 'new passenger'
+
+  - type: admin_login
+    patterns:
+      - 'admin console'
+
+  - type: login
+    patterns:
+      - 'log in'
+      - 'login'
+      - 'sign in'
+
+  # book/pay/cancel/rebook — выше advanced-search и add_contact
+  - type: book
+    patterns:
+      - '^book\b'
+      - '^purchase\b'
+      - '^reserve\b'
+      - '^buy\b'
+      - 'order a ticket'
+
+  - type: pay
+    patterns:
+      - '^pay\b'
+      - 'payment'
+
+  # check_refund выше cancel: "how much refunded" — запрос суммы, не отмена
+  - type: check_refund
+    patterns:
+      - 'refund'
+      - 'how much.*cancel'
+      - 'calculate.*cancel'
+
+  - type: cancel
+    patterns:
+      - '\bcancel\b'
+
+  - type: rebook
+    patterns:
+      - 'rebook'
+      - 'change seat'
+      - 'change ticket'
+      - 'change the trip'
+
+  - type: collect
+    patterns:
+      - '^collect\b'
+      - 'pick up'
+      - 'take the ticket'
+
+  # search — выше view_trip чтобы "open the details ... cheapest trip" не было search_advanced
+  # add_trip выше search_train: "Add a new trip ... departing 09:00" иначе
+  # ловится search_train по слову "departing"
+  - type: add_trip
+    patterns:
+      - '^add.*trip'
+      - '^create.*trip'
+
+  - type: search_advanced
+    patterns:
+      - '^advanced search'
+      - 'cheapest\s+trips'
+      - 'quickest\s+trips'
+      - 'fewest.stop'
+
+  - type: search_train
+    patterns:
+      - 'search'
+      - 'find train'
+      - 'find trip'
+      - 'trips from'
+      - 'trains from'
+      - 'departing'
+
+  - type: view_trip
+    patterns:
+      - 'open the details'
+      - 'details of the'
+      - 'first trip found'
+      - 'trip found'
+      - 'cheapest trip found'
+      - 'open.*order'
+
+  - type: query_food_trip
+    patterns:
+      - 'food menu'
+      - 'food offered on'
+      - 'meal'
+
+  - type: browse_food_station
+    patterns:
+      - 'food store'
+      - 'browse food'
+      - 'station food'
+      - 'food at .* station'
+
+  # add_contact выше get_contact
+  - type: add_contact
+    patterns:
+      - 'add a contact'
+      - 'add a new contact'
+      - '^add.*contact\b'
+
+  - type: get_contact
+    patterns:
+      - 'contact book'
+      - 'first contact'
+      - 'open.*contact'
+      - 'take.*contact'
+
+  - type: query_orders
+    patterns:
+      - 'list of orders'
+      - 'refresh.*order'
+      - 'orders.*high.speed'
+      - 'orders.*regular'
+      - 'orders.*paid'
+      - 'order.*status'
+      - 'view.*orders'
+      - 'orders for'
+
+  - type: add_station
+    patterns:
+      - 'add.*station'
+      - 'new station'
+
+  - type: add_train_type
+    patterns:
+      - 'add.*train type'
+      - 'new train type'
+      - 'gaoties'
+
+  - type: add_route
+    patterns:
+      - 'add.*route'
+      - 'new route'
+
+  # Дополнительный вариант query_orders
+  - type: query_orders
+    patterns:
+      - 'paid'
+      - 'filter.*paid'
+      - 'paid.*filter'
+
+# action_vocabulary удалён: семантический мост NL → code обеспечивается
+# dense-векторами (SemanticReranker / BGE-M3) в src/similarity/encoder.py.
