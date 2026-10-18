@@ -193,6 +193,17 @@ def _init_service_matcher(ix) -> None:
     # Внутренние типы из скелета — заменяет ручные _PARAM_STOPWORDS и _DOC_STOPWORDS
     _internal_type_names = _build_internal_type_names(ix)
 
+    # Инициализировать Qwen ПЕРВЫМ — нужен для passport generation до BGE-M3
+    global _QWEN_ENCODER
+    if _QWEN_ENCODER is None:
+        _QWEN_ENCODER = QwenEncoder(targets_root=_TARGETS_ROOT)
+
+    # Загрузить паспорта сервисов (офлайн, кешируются в ~/.cache/service_passports.json).
+    # Паспорта содержат business_summary + synonyms для каждого handler-а, генерируются
+    # Qwen из исходного кода контроллеров (не хардкод).
+    from src.localization.passport_generator import load_or_generate_passports
+    _passports = load_or_generate_passports(ix, _TARGETS_ROOT, _QWEN_ENCODER)
+
     # SemanticReranker: построить doc_texts и инициализировать BGE-M3
     _RERANKER = SemanticReranker()
     if _RERANKER.enabled:
@@ -263,7 +274,17 @@ def _init_service_matcher(ix) -> None:
                     extra_parts.append(nl_tok)
                     seen.add(nl_tok)
 
-            texts[nid] = (base + " " + " ".join(extra_parts[:25])).strip()
+            # Passport synonyms: Qwen-генерированные бизнес-термины из кода контроллера.
+            # Не фильтруются через _is_informative — они уже специфичны для данного endpoint.
+            _p = _passports.get(nid)
+            if _p:
+                for _syn in _p.synonyms[:8]:
+                    for _tok in toks(_syn):
+                        if len(_tok) > 2 and _tok not in seen:
+                            extra_parts.append(_tok)
+                            seen.add(_tok)
+
+            texts[nid] = (base + " " + " ".join(extra_parts[:40])).strip()
 
         _DOC_TEXTS = texts
         print(
@@ -280,22 +301,23 @@ def _init_service_matcher(ix) -> None:
     # CE doc_texts: иерархический контекст из Java исходников (сервис → класс → метод).
     # Включает javadoc, logger messages, flow_steps, соседей класса.
     # Объединяется с _DOC_TEXTS (verb+path+name) для CE — богаче BM25 doc_texts.
+    # + паспортные synonyms и business_summary для различения близких handler-ов.
     java_ctx = build_java_context(ix, _TARGETS_ROOT)
     base_texts = _DOC_TEXTS or {}
-    _CE_DOC_TEXTS = {
-        nid: (base_texts.get(nid, '') + ' ' + java_ctx.get(nid, '')).strip()
-        for nid in set(list(base_texts) + list(java_ctx))
-    }
+    _CE_DOC_TEXTS = {}
+    for nid in set(list(base_texts) + list(java_ctx)):
+        parts = [base_texts.get(nid, ""), java_ctx.get(nid, "")]
+        _p = _passports.get(nid)
+        if _p:
+            parts.append(_p.business_summary)
+            parts.append(" ".join(_p.synonyms))
+        _CE_DOC_TEXTS[nid] = " ".join(p for p in parts if p).strip()
     import sys as _sys3
     print(
-        f"[searcher] CE doc_texts: {len(java_ctx)} handlers enriched with Java context",
+        f"[searcher] CE doc_texts: {len(java_ctx)} handlers enriched "
+        f"(Java context + {sum(1 for n in java_ctx if n in _passports)} passports)",
         file=_sys3.stderr,
     )
-
-    # Qwen2.5-Coder: инициализировать только если не запущен из Pass 1
-    global _QWEN_ENCODER
-    if _QWEN_ENCODER is None:
-        _QWEN_ENCODER = QwenEncoder(targets_root=_TARGETS_ROOT)
 
 
 def _is_g_side(a: str, b: str, reason: str) -> bool:

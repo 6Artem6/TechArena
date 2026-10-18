@@ -319,6 +319,7 @@ class QwenEncoder:
         schema: dict | None = None,
         system: str | None = None,
         num_predict: int | None = None,
+        timeout: int | None = None,
     ) -> dict:
         payload = json.dumps({
             "model":   self.model,
@@ -333,7 +334,7 @@ class QwenEncoder:
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-        with urlopen(req, timeout=_TIMEOUT_S) as resp:
+        with urlopen(req, timeout=timeout or _TIMEOUT_S) as resp:
             data = json.loads(resp.read())
         return json.loads(data.get("response", "{}"))
 
