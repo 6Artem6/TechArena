@@ -145,6 +145,9 @@ _CLASSIFY_SYSTEM = (
     '  "add a new trip G101 on route X" → add_trip, []\n'
     '  "add a new station Ning Bo" → add_station, []\n'
     '  "log in to admin console" → admin_login, []\n'
+    '  "open details of cheapest trip" → view_trip, []\n'
+    '  "view trip details" → view_trip, []\n'
+    '  "check trip detail information" → view_trip, []\n'
     'Output ONLY valid JSON: {"step_type": "...", "search_keywords": [...]}. No other text.'
 )
 

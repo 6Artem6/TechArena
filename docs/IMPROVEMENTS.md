@@ -1,7 +1,7 @@
 # Предложения по улучшению — чего не хватает
 
-> Контекст: S0 gold = **0.852**. Платформенный итог по всем сценариям предположительно ниже (~0.68).  
-> Baseline быстро достигает 0.70–0.80 на знакомых сценариях. Ниже — анализ пробелов и конкретные предложения.
+> Контекст: S0 gold = **0.852**. Текущий платформенный результат: **0.7560** (S1=0.807, S2=0.737, S3=0.802, S4=0.808, S5=0.681, S6=0.775, S7=0.683).  
+> Слабые сценарии: S5 (top-1-per-module убирает getTransferResult), S7 (admin+passenger dual-role).
 
 ---
 
@@ -323,3 +323,133 @@ ADR-030 описывает многогранулярные эмбеддинги
 | @Async, @Transactional info | В skeleton есть аннотации — можно использовать |
 
 **Вывод:** CFG — самое мощное из ADR-021. **tree-sitter уже работает на Java-исходниках** (`src/parsers/java.py`). Инфраструктура для извлечения условий есть. Нужно добавить traversal `if_statement` узлов в JavaParser + хранение условий → использовать в `pruned_closure`. Объём: ~60-80 строк нового кода + тестирование.
+
+---
+
+## 8. Pass 1 — Qwen классификация шагов (сессия 2026-10-18)
+
+**Статус:** инфраструктура реализована, keywords временно отключены.
+
+`QwenEncoder.batch_classify_steps()` запускает параллельную (4 воркера) Qwen-классификацию всех шагов сценария до `enhanced_ground()`. Результат: `QwenClassifyOutput{step_type, search_keywords}` на шаг, кешируется в `~/.cache/qwen_encoder_cache.pkl` с ключом `("cls", action)`.
+
+### 8.1 Keywords для non-search шагов (P1.1)
+
+**Проблема:** применение `search_keywords` ко всем шагам вызывает регрессию в S5 — токены "cheapest", "trips" сдвигают BM25 и убирают preserve-other entry point.
+
+**Решение:** включать keywords только для шагов где они безопасны:
+```python
+_SAFE_KEYWORD_TYPES = frozenset({
+    "book", "pay", "cancel", "collect", "rebook",
+    "enter_station", "add_consign", "query_consign",
+    "check_price", "check_refund",
+})
+# В enhanced_ground():
+if _qwen_classify and _qwen_classify.search_keywords:
+    if step_info.step_type in _SAFE_KEYWORD_TYPES:
+        step_info.extra_tokens = list(set(
+            step_info.extra_tokens + _qwen_classify.search_keywords
+        ))
+```
+
+**Ожидаемый эффект:** +0.01 avg. Риск: низкий.
+
+### 8.2 Fix view_trip в промпте Qwen (P1.2)
+
+"Open the details of the cheapest trip found" → Qwen возвращает `query_orders` вместо `view_trip`. Добавить пример в `_CLASSIFY_SYSTEM` в `qwen_encoder.py`:
+
+```
+'  "open details of cheapest trip" → view_trip, []'
+'  "view trip details" → view_trip, []'
+```
+
+**Ожидаемый эффект:** +0.005 S5. Риск: низкий. Необходим перед P1.3.
+
+### 8.3 Enable step_type override из Pass 1 (P1.3)
+
+После P1.1 + P1.2: убрать `_STEP_RULES` из `step_typer.py`, использовать `_qwen_classify.step_type` как step_type. Делает pipeline переносимым — Qwen классифицирует из кода, не хардкод.
+
+**Ожидаемый эффект:** +0.01–0.02 avg. Риск: средний (нужна проверка всех 7 сценариев).
+
+---
+
+## 9. Паспорта сервисов — офлайн Qwen обогащение (новое)
+
+**Ключевая идея:** текущие `doc_texts` для BGE-M3/CE строятся механически из logger messages + Javadoc. Они не содержат бизнес-семантику. Пример проблемы: `getTransferResult` и `getByCheapest` оба в `ts-travel-plan-service` — top-1-per-module убивает один из них (S5 0.681).
+
+### 9.1 File-level генерация паспортов (SP.1) — **главный приоритет**
+
+Qwen получает целый контроллер + сервисный слой + DTO → JSON с бизнес-описанием на handler:
+
+```json
+{
+  "nid": "ts-travel-plan-service/getTransferResult",
+  "business_summary": "Find trains requiring transfer/layover between stations",
+  "synonyms": ["transit", "connection", "via", "layover", "indirect route", "transfer"]
+}
+```
+
+Реализация: новый модуль `src/localization/passport_generator.py`:
+- Читает `.java` файлы по сервисам
+- `ThreadPoolExecutor(4)` по файлам (офлайн, ~2 мин на все ~30 сервисов)
+- Кешируется в `~/.cache/service_passports.json`
+- При старте загружается в `_PASSPORTS: dict[nid, PassportData]`
+
+**Ожидаемый эффект:** +0.02–0.05 S5 (getTransferResult наконец отличим от getByCheapest). Риск: низкий (аддитивное обогащение). Усилие: 4–6 ч.
+
+### 9.2 Обогатить CE doc_texts синонимами (SP.2 = CE.1)
+
+После SP.1: дописать `passport.synonyms` в `_CE_DOC_TEXTS[nid]` в `java_context.py:build_java_context()`. CE cross-attention видит "transit layover connection" в документе — правильно матчит "search with a transfer".
+
+**Ожидаемый эффект:** +0.01–0.02 S5. Риск: низкий. Усилие: 1 ч.
+
+### 9.3 Обогатить BGE-M3 doc_texts синонимами (SP.3)
+
+Добавить `synonyms` в `build_nl_enrichment()` → проходят через `is_informative` TF-IDF фильтр — generic слова отсеиваются автоматически.
+
+**Ожидаемый эффект:** +0.01. Риск: низкий. Усилие: 1 ч.
+
+### 9.4 AST дедупликация перед генерацией (SP.4)
+
+Хешировать структурно идентичные handler-ы → один Qwen-вызов на кластер. Экономия 60–80% вызовов LLM. При ~200 handler-ах офлайн-прогон занимает <2 мин без дедупликации — для конкурса несущественно.
+
+**Ожидаемый эффект:** ~0 IoU (оптимизация скорости). Приоритет: LOW.
+
+---
+
+## 10. Cross-Encoding суммаризации (новое)
+
+### 10.1 Вариант A: обогатить _CE_DOC_TEXTS (CE.1 = SP.2)
+
+Самый безопасный вариант — см. п. 9.2. CE работает попарно (query, doc); длинный doc с бизнес-синонимами только улучшает cross-attention.
+
+### 10.2 Вариант B: двухуровневый CE — SKIP
+
+Stage 1: `CE(query, service_profile)` → top-K сервисов. Stage 2: `CE(query, handler_doc)` внутри отобранных. Каскадная ошибка на уровне Stage 1 = полный промах. S3/S4 работают хорошо именно потому что flat-поиск не ограничен сервисом.
+
+### 10.3 Вариант C: отдельный β-сигнал (CE.3)
+
+`final = α·ce_handler + β·ce_summary`. Требует тюнинга α/β на 7 сценариях — риск переобучения. Рассматривать только после CE.1 если прироста недостаточно.
+
+---
+
+## 11. Архитектурные изменения (оценка)
+
+| Идея | Ожидаемый ΔIoU | Риск | Решение |
+|---|---|---|---|
+| Иерархический routing (домен→сервис→handler) | неизвестен | высокий (каскад) | SKIP |
+| Scenario-first mining из graph paths | +0.02–0.03 S7 | высокий | LATER |
+| LanceDB ANN для паспортов | ~0 (масштабируемость) | низкий | LATER |
+
+**Иерархический routing** — архитектурно правильно, но flat BM25+BGE-M3+CE выигрывает за счёт отсутствия жёсткого routing. Добавление hard-routing уровня сервиса создаёт каскадные ошибки для S3/S4.
+
+**Scenario-first mining** — потенциально решает S7 (admin vs passenger = разные кластеры маршрутов). Нужен отдельный граф сценариев из canonical execution paths. Сложность: 10+ ч.
+
+---
+
+## Текущий приоритет реализации (2026-10-18)
+
+```
+P1.1 (keywords non-search)  →  P1.2 (view_trip fix)  →  SP.1 (passports)
+    →  SP.2/CE.1 (enrich CE)  →  SP.3 (enrich BGE-M3)
+    →  P1.3 (step_type override)  →  ST.1 (удалить _STEP_RULES)
+```

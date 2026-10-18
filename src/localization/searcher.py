@@ -40,6 +40,14 @@ _STEP_TYPES_USE_CONTEXT = frozenset({
     "add_consign", "query_consign", "change_seat",
 })
 
+# Типы шагов для которых Pass 1 search_keywords безопасны.
+# Для search/search_advanced/view_trip keywords вроде "cheapest"/"trips" сдвигают BM25 вредно.
+_SAFE_KEYWORD_TYPES = frozenset({
+    "book", "pay", "cancel", "collect", "rebook",
+    "enter_station", "add_consign", "query_consign",
+    "check_price", "check_refund",
+})
+
 
 # ---------------------------------------------------------------------------
 # Сиблинг-пары (P-75) — вычисляются из index при первом вызове
@@ -599,13 +607,12 @@ def enhanced_ground(
         # --- Шаг 2: step_type + extra_tokens (Фаза 2.1) ---
         step_info = classify(act)
 
-        # Pass 1: результаты закешированы для будущего использования.
-        # Применение search_keywords временно отключено — некоторые keywords
-        # (cheapest, trips) сдвигают BM25 и вызывают регрессию S5.
-        # Включить после доработки промпта: убрать _USE_PASS1_KEYWORDS guard.
-        _USE_PASS1_KEYWORDS = False
+        # Pass 1: применять search_keywords только для шагов где они безопасны.
+        # Для search/search_advanced/view_trip keywords "cheapest"/"trips" сдвигают BM25 вредно.
+        # Для book/pay/cancel/collect keywords "inside"/"first class" безопасны и помогают.
         _qwen_classify = get_step_classify(act)
-        if _USE_PASS1_KEYWORDS and _qwen_classify is not None and _qwen_classify.search_keywords:
+        if (_qwen_classify is not None and _qwen_classify.search_keywords
+                and step_info.step_type in _SAFE_KEYWORD_TYPES):
             step_info.extra_tokens = list(set(
                 step_info.extra_tokens + _qwen_classify.search_keywords
             ))
