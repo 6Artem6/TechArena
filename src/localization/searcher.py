@@ -29,7 +29,7 @@ from src.similarity.cross_encoder import CrossEncoder  # noqa: E402
 from src.localization.hub_scorer import precompute_reachability, rerank_by_hub  # noqa: E402
 from src.localization.session_context import SessionContext  # noqa: E402
 from src.localization.java_context import build_java_context, build_nl_enrichment  # noqa: E402
-from src.localization.qwen_encoder import QwenEncoder, get_candidate_handlers, graph_name_lookup  # noqa: E402
+from src.localization.qwen_encoder import QwenEncoder, get_candidate_handlers_indexed  # noqa: E402
 
 
 # Типы шагов, которые наследуют train_type из предыдущего шага через oracle carry-over.
@@ -87,6 +87,39 @@ def _build_internal_type_names(ix) -> frozenset[str]:
         if v.get("kind") == "type" and v.get("fqn"):
             result.add(v["fqn"].split(".")[-1])
     return frozenset(result)
+
+
+def flush_qwen_cache() -> None:
+    """Сохранить Qwen-кеш на диск (вызывается в конце predict.py)."""
+    if _QWEN_ENCODER is not None:
+        _QWEN_ENCODER.flush()
+
+
+# Pass 1: кеш результатов Qwen-классификации шагов {action → QwenClassifyOutput}
+_STEP_CLASSIFY_CACHE: dict[str, object] = {}
+
+
+def batch_classify_steps(actions: list[str]) -> list:
+    """Pass 1: параллельная классификация шагов сценария через Qwen.
+
+    Возвращает list[QwenClassifyOutput] в том же порядке что и actions.
+    Пустой список если Qwen недоступен.
+    Инициализирует QwenEncoder если ещё не запущен (он может быть вызван
+    до enhanced_ground, поэтому не ждём _init_service_matcher).
+    """
+    global _STEP_CLASSIFY_CACHE, _QWEN_ENCODER
+    if _QWEN_ENCODER is None:
+        _QWEN_ENCODER = QwenEncoder(targets_root=_TARGETS_ROOT)
+    if not _QWEN_ENCODER.enabled:
+        return []
+    results = _QWEN_ENCODER.batch_classify_steps(actions)
+    _STEP_CLASSIFY_CACHE = {action: r for action, r in zip(actions, results)}
+    return results
+
+
+def get_step_classify(action: str):
+    """Получить результат Pass 1 для конкретного шага (None если нет)."""
+    return _STEP_CLASSIFY_CACHE.get(action)
 
 
 def set_targets_root(root) -> None:
@@ -251,10 +284,10 @@ def _init_service_matcher(ix) -> None:
         file=_sys3.stderr,
     )
 
-    # Qwen2.5-Coder: пробует ollama → transformers → disabled
-    # targets_root передаётся для определения языка проекта из файловых расширений
+    # Qwen2.5-Coder: инициализировать только если не запущен из Pass 1
     global _QWEN_ENCODER
-    _QWEN_ENCODER = QwenEncoder(targets_root=_TARGETS_ROOT)
+    if _QWEN_ENCODER is None:
+        _QWEN_ENCODER = QwenEncoder(targets_root=_TARGETS_ROOT)
 
 
 def _is_g_side(a: str, b: str, reason: str) -> bool:
@@ -566,6 +599,17 @@ def enhanced_ground(
         # --- Шаг 2: step_type + extra_tokens (Фаза 2.1) ---
         step_info = classify(act)
 
+        # Pass 1: результаты закешированы для будущего использования.
+        # Применение search_keywords временно отключено — некоторые keywords
+        # (cheapest, trips) сдвигают BM25 и вызывают регрессию S5.
+        # Включить после доработки промпта: убрать _USE_PASS1_KEYWORDS guard.
+        _USE_PASS1_KEYWORDS = False
+        _qwen_classify = get_step_classify(act)
+        if _USE_PASS1_KEYWORDS and _qwen_classify is not None and _qwen_classify.search_keywords:
+            step_info.extra_tokens = list(set(
+                step_info.extra_tokens + _qwen_classify.search_keywords
+            ))
+
         # Обновить admin-контекст по типу шага (carry-over смены роли)
         if step_info.step_type == "admin_login":
             is_admin = True
@@ -620,33 +664,23 @@ def enhanced_ground(
             if domain_extras:
                 q = q + domain_extras
 
-        # --- Qwen query decomposition → graph-guided name injection ---
-        # Стратегия: Qwen генерирует QwenOutput (Pydantic) →
-        #   bm25 токены → валидация против кандидатов →
-        #   graph_name_lookup: прямой поиск handler-а по имени.
-        #   query → BGE-M3 если confidence достаточно (C).
-        # Инжект только при confidence >= MIN_CONFIDENCE.
+        # --- Qwen index-based handler selection ---
+        # Стратегия: Qwen получает пронумерованный список кандидатов →
+        #   возвращает {index, confidence} →
+        #   прямой inject nid из nid_map без graph_name_lookup.
+        # Инжект только при index > 0 и confidence >= MIN_CONFIDENCE.
         from src.localization.qwen_encoder import _MIN_CONFIDENCE  # noqa: PLC0415
         _bge_query = act_extended
-        _qwen_valid_bm25: list[str] = []  # validated tokens для graph lookup после ranking
         _qwen_result = None
+        _qwen_injected_nid: str | None = None
+        _cand_nids: dict[int, str] = {}
         if _QWEN_ENCODER is not None and _QWEN_ENCODER.enabled and oracle is not None:
-            _cands = get_candidate_handlers(oracle, ix)
-            _qwen_result = _QWEN_ENCODER.decompose(act, oracle.step_history, _cands)
-            if _qwen_result.bm25 and _qwen_result.confidence >= _MIN_CONFIDENCE:
-                # Валидация: оставить только токены ≥8 символов, совпадающие с именами кандидатов
-                # Кандидаты теперь могут быть "handlerName VERB /path" → берём первое слово
-                _all_cand_names = [
-                    n.lower().split()[0]  # первое слово (имя метода без verb/path)
-                    for ns in _cands.values() for n in ns
-                ]
-                for _tok in _qwen_result.bm25:
-                    _tok_l = _tok.lower()
-                    if len(_tok_l) >= 8 and any(_tok_l in n or n in _tok_l for n in _all_cand_names):
-                        _qwen_valid_bm25.append(_tok_l)
-            # Qwen-query → BGE-M3: НЕ используем — Qwen query слишком специфичен,
-            # дропает общие handler-ы в других сервисах → регрессия на S2/S5/S7.
-            # _bge_query остаётся act_extended всегда.
+            _cand_display, _cand_nids = get_candidate_handlers_indexed(oracle, ix)
+            _qwen_result = _QWEN_ENCODER.decompose(act, oracle.step_history, _cand_display)
+            if _qwen_result.index > 0 and _qwen_result.confidence >= _MIN_CONFIDENCE:
+                _qwen_injected_nid = _cand_nids.get(_qwen_result.index)
+        # BGE-M3 query: не используем Qwen query — слишком специфичен, вызывает регрессию.
+        # _bge_query остаётся act_extended всегда.
 
         # --- Oracle carry-over: обновить oracle из текста шага (P-54) ---
         if oracle is not None:
@@ -820,36 +854,28 @@ def enhanced_ground(
                     best_per_mod[mod] = h
             hs = set(best_per_mod.values())
 
-        # --- Qwen graph-name injection: заменить top-1 в модуле на Qwen-найденный handler ---
-        # Условие: есть step_history (не первый шаг) + валидные Qwen bm25-токены
-        # Валидные токены: ≥8 символов, совпадают с именами кандидатов (проверено выше)
-        if _qwen_valid_bm25 and hs and oracle is not None and oracle.step_history:
-            _active = set(getattr(oracle, "active_services", set()))
-            _reach = oracle.step_history[-1].reachable_modules if oracle.step_history else set()
-            _g_matched = graph_name_lookup(_qwen_valid_bm25, ix, _active, _reach)
-            if _g_matched:
-                # Лексический фильтр: хотя бы одно слово ≥6 букв из оригинального
-                # имени handler-а должно присутствовать в тексте action.
-                # Предотвращает инжект при галлюцинациях Qwen с высоким confidence.
-                # Пример: "createNewContacts" → "create","contacts" НЕ в "get contact" → блок.
+        # --- Qwen index injection: заменить top-1 в модуле на Qwen-выбранный handler ---
+        # Условие: Qwen вернул валидный index + confidence >= MIN_CONFIDENCE +
+        #          lexical filter: хотя бы одно слово ≥6 букв из имени handler-а
+        #          присутствует в тексте action (предотвращает галлюцинации).
+        if _qwen_injected_nid and hs:
+            _gmod = ix.module.get(_qwen_injected_nid, "")
+            if _gmod in best_per_mod and best_per_mod[_gmod] != _qwen_injected_nid:
+                # Lexical filter: имя нового handler-а должно семантически
+                # пересекаться с текстом шага (хотя бы одно слово ≥6 букв).
+                _inj_name = ix.N.get(_qwen_injected_nid, {}).get("name", "")
+                _inj_words = [w for w in toks(_inj_name) if len(w) >= 6]
                 _act_lower = act.lower()
-                _lex_matched: set[str] = set()
-                for _gn in _g_matched:
-                    _orig = ix.N.get(_gn, {}).get("name", "")
-                    if not _orig:
-                        continue
-                    _words = [w for w in toks(_orig) if len(w) >= 6]
-                    if any(w in _act_lower for w in _words):
-                        _lex_matched.add(_gn)
-                _g_matched = _lex_matched
-
-            if _g_matched:
-                # Обновить best_per_mod: если matched handler в том же модуле → заменить
-                for _gn in _g_matched:
-                    _gmod = ix.module.get(_gn, "")
-                    if _gmod in best_per_mod:
-                        best_per_mod[_gmod] = _gn  # swap: Qwen handler приоритетнее
-                hs = set(best_per_mod.values())
+                if _inj_words and any(w in _act_lower for w in _inj_words):
+                    _prev_name = ix.N.get(best_per_mod[_gmod], {}).get("name", "?")
+                    best_per_mod[_gmod] = _qwen_injected_nid
+                    hs = set(best_per_mod.values())
+                    print(
+                        f"[qwen] {_gmod.replace('ts-','').replace('-service','')} "
+                        f"{_prev_name} → {_inj_name} "
+                        f"(conf={_qwen_result.confidence:.2f})",
+                        file=sys.stderr,
+                    )
 
         # Записать граф-состояние шага для следующего (zero-hardcode flow tracking)
         if flow_ctx is not None and hs:

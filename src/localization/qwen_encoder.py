@@ -16,7 +16,9 @@ Pipeline:
 from __future__ import annotations
 
 import json
+import pickle
 import sys
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,43 +35,33 @@ _OLLAMA_TAGS_URL     = "http://localhost:11434/api/tags"
 _DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:3b"
 _HF_MODEL_NAME       = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 _TIMEOUT_S           = 10
-_NUM_PREDICT         = 160
+_NUM_PREDICT         = 40   # индекс = 1-3 цифры, нет нужды в 160 токенах
 _MIN_CONFIDENCE      = 0.55  # инжект только при confidence >= этого порога
+_CACHE_FILE          = Path.home() / ".cache" / "qwen_encoder_cache.pkl"
 
 
 # ---------------------------------------------------------------------------
-# Pydantic-контракт вывода — структурированный ответ Qwen
+# Pydantic-контракт вывода — индекс лучшего handler-а
 # ---------------------------------------------------------------------------
 
 class QwenOutput(BaseModel):
-    """Структурированный ответ Qwen на запрос декомпозиции шага.
+    """Ответ Qwen: 1-based индекс лучшего handler-а + уверенность.
 
-    bm25      — точные имена handler-ов (lowercase) + ключевые глаголы действия.
-                Пример: ["gettransferresult", "transfer", "via"]
-    query     — NL-запрос для semantic search; все доменные слова сохранены.
-                Пример: "find trip with transfer at intermediate station"
-    confidence — уверенность модели в совпадении bm25-токенов с action (0.0-1.0).
+    index      — 1-based индекс из пронумерованного списка кандидатов.
+                 0 = нет подходящего handler-а.
+    confidence — уверенность модели (0.0-1.0).
                  При confidence < _MIN_CONFIDENCE инжект в граф не выполняется.
     """
-    bm25: list[str] = Field(
-        default_factory=list,
-        description=(
-            "3-5 items: EXACT handler method name (lowercase) matching action "
-            "+ key action verbs. Example: [\"gettransferresult\", \"transfer\"]"
-        ),
-    )
-    query: str = Field(
-        default="",
-        description=(
-            "One NL sentence for semantic search. "
-            "Keep ALL domain terms (transfer, fewest-stops, intermediate, etc)."
-        ),
+    index: int = Field(
+        default=0,
+        ge=0,
+        description="1-based handler index from numbered candidate list, 0=no match",
     )
     confidence: float = Field(
         default=0.5,
         ge=0.0,
         le=1.0,
-        description="Confidence that bm25 tokens correctly match the action (0.0-1.0).",
+        description="Confidence 0-1 that the selected handler matches the action",
     )
 
     @classmethod
@@ -78,13 +70,85 @@ class QwenOutput(BaseModel):
         try:
             return cls.model_validate(raw)
         except (ValidationError, Exception):
-            # Попробовать спасти хотя бы bm25 и query
-            raw_bm25 = raw.get("bm25", [])
-            bm25 = [str(t).strip().lower() for t in raw_bm25 if t][:6] if isinstance(raw_bm25, list) else []
-            query = str(raw.get("query", "")).strip()
+            idx = raw.get("index", 0)
+            try:
+                idx = max(0, int(idx))
+            except (TypeError, ValueError):
+                idx = 0
             conf = float(raw.get("confidence", 0.5)) if "confidence" in raw else 0.5
             conf = max(0.0, min(1.0, conf))
-            return cls(bm25=bm25, query=query, confidence=conf)
+            return cls(index=idx, confidence=conf)
+
+
+# ---------------------------------------------------------------------------
+# Pass 1: classify-only output (step_type + search_keywords, без кандидатов)
+# ---------------------------------------------------------------------------
+
+class QwenClassifyOutput(BaseModel):
+    """Результат Pass 1: тип шага + ключевые слова для поиска handler-а.
+
+    step_type       — тип действия пользователя (login/book/pay/search_transit/...)
+    search_keywords — 1–4 токена для BM25-запроса (заменяют extra_tokens step_typer)
+    """
+    step_type: str = Field(default="other")
+    search_keywords: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_raw(cls, raw: dict) -> "QwenClassifyOutput":
+        try:
+            return cls.model_validate(raw)
+        except Exception:
+            st = str(raw.get("step_type", "other")).strip() or "other"
+            kw = raw.get("search_keywords", [])
+            if isinstance(kw, list):
+                kw = [str(k) for k in kw if k]
+            else:
+                kw = []
+            return cls(step_type=st, search_keywords=kw)
+
+
+_CLASSIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "step_type": {"type": "string"},
+        "search_keywords": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["step_type", "search_keywords"],
+}
+
+_CLASSIFY_SYSTEM = (
+    "You are classifying user actions in a web application.\n"
+    "Given a user action, return:\n"
+    "  step_type: EXACTLY one of these values:\n"
+    "    login, register, book, pay, cancel, rebook, collect,\n"
+    "    search, search_advanced, search_transit,\n"
+    "    view_trip, query_orders, query_consign, add_consign,\n"
+    "    add_contact, get_contact, browse_food_station, query_food_trip,\n"
+    "    check_price, check_refund, enter_station, admin_login,\n"
+    "    add_station, add_train_type, add_route, add_trip, other\n"
+    "  search_keywords: 0-3 technical terms useful for finding the correct API handler\n\n"
+    "CRITICAL rules:\n"
+    "  - search_transit = ONLY when action explicitly mentions transfer/connection/via/layover\n"
+    "  - search_advanced = advanced search for cheapest/quickest/fewest-stops (NOT transit)\n"
+    "  - search = basic train search (no advanced criteria, no transfer)\n"
+    "  - add_trip = adding a new trip/journey to the schedule (NOT add_consign!)\n"
+    "  - search_keywords: DO NOT add city names, train numbers, dates; DO add payment/class/option\n\n"
+    "Examples:\n"
+    '  "ask for trips with a transfer via Suzhou" → search_transit, ["transfer"]\n'
+    '  "advanced search: cheapest trips" → search_advanced, []\n'
+    '  "advanced search: quickest trips" → search_advanced, []\n'
+    '  "advanced search: fewest stops" → search_advanced, []\n'
+    '  "search high-speed trains from A to B" → search, []\n'
+    '  "pay from internal account balance" → pay, ["inside"]\n'
+    '  "pay using external payment service" → pay, ["payment", "service"]\n'
+    '  "book first-class seat with food" → book, ["first class", "food"]\n'
+    '  "add a new trip G101 on route X" → add_trip, []\n'
+    '  "add a new station Ning Bo" → add_station, []\n'
+    '  "log in to admin console" → admin_login, []\n'
+    'Output ONLY valid JSON: {"step_type": "...", "search_keywords": [...]}. No other text.'
+)
+
+_CLASSIFY_NUM_PREDICT = 60  # короче чем handler selection (40), но массив может быть длиннее
 
 
 # ---------------------------------------------------------------------------
@@ -94,24 +158,19 @@ class QwenOutput(BaseModel):
 _OLLAMA_JSON_SCHEMA = {
     "type": "object",
     "properties": {
-        "bm25": {
-            "type": "array",
-            "items": {"type": "string"},
-            "maxItems": 6,
-            "description": "Exact handler method names (lowercase) + key action verbs",
-        },
-        "query": {
-            "type": "string",
-            "description": "NL search query keeping ALL domain terms",
+        "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "1-based handler index, 0 if no match",
         },
         "confidence": {
             "type": "number",
             "minimum": 0.0,
             "maximum": 1.0,
-            "description": "Confidence 0-1 that bm25 matches action",
+            "description": "Confidence 0-1 that selected handler matches action",
         },
     },
-    "required": ["bm25", "query", "confidence"],
+    "required": ["index", "confidence"],
 }
 
 
@@ -144,30 +203,28 @@ def _detect_language(targets_root: "Path | None") -> str:
 def _build_prompts(language: str) -> tuple[str, str]:
     system = (
         f"You are a {language} microservice expert.\n"
-        "Given a user action and handler method names from nearby services, "
-        "find the BEST matching handler and return structured JSON.\n\n"
+        "Given a user action and a numbered list of handler methods, "
+        "select the index of the BEST matching handler.\n\n"
         "Rules:\n"
-        "  1. Scan handler names for words matching the action — include EXACT name (lowercase) in bm25.\n"
-        "  2. Include key action verbs (transfer, cheapest, min, execute, pay, etc.) in bm25.\n"
-        "  3. query: keep ALL domain terms; do NOT drop words like 'transfer', 'fewest', 'via'.\n"
-        "  4. confidence: 1.0 if handler name obviously matches, 0.5 if uncertain, 0.2 if no match.\n\n"
+        "  1. Match action verb/noun semantically to handler name.\n"
+        "  2. confidence: 1.0 if name clearly matches action, 0.5 if uncertain, 0.2 if no match.\n"
+        "  3. index=0 if NO handler in the list matches the action intent.\n\n"
         "Examples:\n"
-        '  action "transfer trip via Suzhou" + handler "getTransferResult"\n'
-        '    → {"bm25": ["gettransferresult", "transfer", "via"], "query": "find trip with transfer via intermediate station", "confidence": 0.9}\n'
-        '  action "fewest stops" + handler "getByMinStation"\n'
-        '    → {"bm25": ["getbyminstation", "min"], "query": "search trips with minimum stops fewest stations", "confidence": 0.85}\n'
-        '  action "board train with order" + handler "executeTicket"\n'
-        '    → {"bm25": ["executeticket", "execute", "board"], "query": "enter station board train execute ticket", "confidence": 0.9}\n'
-        '  action "pay for order" + handler "payOrder"\n'
-        '    → {"bm25": ["pay", "order", "payment"], "query": "pay order from account balance", "confidence": 0.8}\n'
-        'Output ONLY valid JSON matching the schema. No other text.'
+        '  action "find trip with transfer via Suzhou", [3] travel2: getTransferResult\n'
+        '    → {"index": 3, "confidence": 0.9}\n'
+        '  action "fewest stops trip", [5] travel: getByMinStation GET /api/v1/travel/minStation\n'
+        '    → {"index": 5, "confidence": 0.85}\n'
+        '  action "board train with order", [2] execute: executeTicket POST /api/v1/execute\n'
+        '    → {"index": 2, "confidence": 0.9}\n'
+        '  action "pay for order via internal balance", [4] inside-payment: payOrder\n'
+        '    → {"index": 4, "confidence": 0.8}\n'
+        'Output ONLY valid JSON: {"index": N, "confidence": F}. No other text.'
     )
     user_tmpl = (
         'Action: "{action}"\n\n'
         "Session history (recent steps → found handlers):\n{history}\n\n"
-        "Handler method names in graph-relevant services\n"
-        "(format: name VERB /path or just name):\n{handlers}\n\n"
-        "JSON output with fields: bm25 (array), query (string), confidence (0.0-1.0)"
+        "Handler candidates (select the BEST index, 0 if none match):\n{handlers}\n\n"
+        'JSON: {{"index": N, "confidence": 0.0-1.0}}'
     )
     return system, user_tmpl
 
@@ -183,10 +240,35 @@ class QwenEncoder:
         targets_root: "Path | None" = None,
     ):
         self.model = model
-        self._cache: dict[tuple, QwenOutput] = {}
+        self._cache: dict[tuple, object] = self._load_cache()
+        self._cache_lock = threading.Lock()
         self._language = _detect_language(targets_root)
         self._system, self._user_tmpl = _build_prompts(self._language)
         self._backend, self.enabled = self._init_backend()
+        self._cache_dirty = False
+
+    @staticmethod
+    def _load_cache() -> "dict[tuple, object]":
+        try:
+            with open(_CACHE_FILE, "rb") as fh:
+                data = pickle.load(fh)
+            # Принимаем QwenOutput (handler selection) и QwenClassifyOutput (Pass 1)
+            valid = {
+                k: v for k, v in data.items()
+                if isinstance(v, (QwenOutput, QwenClassifyOutput))
+            }
+            print(f"[qwen] кеш загружен: {len(valid)} записей", file=sys.stderr)
+            return valid
+        except Exception:
+            return {}
+
+    def _save_cache(self) -> None:
+        try:
+            _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(_CACHE_FILE, "wb") as fh:
+                pickle.dump(self._cache, fh)
+        except Exception as e:
+            print(f"[qwen] кеш не сохранён: {e}", file=sys.stderr)
 
     # ------------------------------------------------------------------
 
@@ -196,10 +278,18 @@ class QwenEncoder:
             with urlopen(Request(_OLLAMA_TAGS_URL), timeout=3) as resp:
                 tags = json.loads(resp.read())
             names = {m["name"] for m in tags.get("models", [])}
-            if any(self.model in n or n.startswith(self.model.split(":")[0]) for n in names):
+            # Точное совпадение: модель должна присутствовать в списке
+            if self.model in names:
                 print(f"[qwen] backend=ollama, модель={self.model}", file=sys.stderr)
                 return "ollama", True
-            fallback = next((n for n in sorted(names) if "qwen2.5-coder" in n), None)
+            # Fallback: ближайшая модель той же семьи (предпочитаем более крупные)
+            family = self.model.split(":")[0]
+            fallback = next(
+                (n for n in sorted(names, reverse=True) if n.startswith(family)),
+                None,
+            )
+            if fallback is None:
+                fallback = next((n for n in sorted(names, reverse=True) if "qwen2.5-coder" in n), None)
             if fallback:
                 self.model = fallback
                 print(f"[qwen] backend=ollama, fallback={self.model}", file=sys.stderr)
@@ -220,14 +310,20 @@ class QwenEncoder:
 
     # ------------------------------------------------------------------
 
-    def _call_ollama(self, prompt: str) -> dict:
+    def _call_ollama(
+        self,
+        prompt: str,
+        schema: dict | None = None,
+        system: str | None = None,
+        num_predict: int | None = None,
+    ) -> dict:
         payload = json.dumps({
             "model":   self.model,
-            "system":  self._system,
+            "system":  system if system is not None else self._system,
             "prompt":  prompt,
-            "format":  _OLLAMA_JSON_SCHEMA,
+            "format":  schema if schema is not None else _OLLAMA_JSON_SCHEMA,
             "stream":  False,
-            "options": {"temperature": 0, "num_predict": _NUM_PREDICT},
+            "options": {"temperature": 0, "num_predict": num_predict or _NUM_PREDICT},
         }).encode()
         req = Request(
             _OLLAMA_GENERATE_URL,
@@ -267,12 +363,15 @@ class QwenEncoder:
         self,
         action: str,
         step_history: list,
-        candidates: dict[str, list[str]],
+        candidates: "list[tuple[int, str, str]]",
     ) -> QwenOutput:
-        if not self.enabled:
+        """Выбрать лучший handler по индексу из пронумерованного списка кандидатов.
+
+        candidates: [(idx, module_short, display_str), ...]
+        """
+        if not self.enabled or not candidates:
             return QwenOutput()
 
-        # История: handler names если есть, иначе module names
         history_lines = []
         for rec in (step_history[-3:] if step_history else []):
             if getattr(rec, "handler_names", None):
@@ -283,8 +382,8 @@ class QwenEncoder:
         history_str = "\n".join(history_lines) or "  (начало сессии)"
 
         handlers_lines = "\n".join(
-            f"  {mod}: {', '.join(names)}"
-            for mod, names in sorted(candidates.items())
+            f"  [{idx}] {mod}: {display}"
+            for idx, mod, display in candidates
         )
         prompt = self._user_tmpl.format(
             action=action,
@@ -305,17 +404,121 @@ class QwenEncoder:
                 raw = {}
 
             result = QwenOutput.from_raw(raw)
-            # Нормализовать bm25 токены
-            result.bm25 = [
-                str(t).strip().lower()
-                for t in result.bm25
-                if t and len(str(t).strip()) > 2
-            ][:6]
+            # Bounds check: индекс должен быть в диапазоне [0, max_idx]
+            max_idx = max((idx for idx, _, _ in candidates), default=0)
+            if result.index > max_idx:
+                result = QwenOutput(index=0, confidence=0.0)
         except Exception:
             result = QwenOutput()
 
         self._cache[cache_key] = result
+        self._cache_dirty = True
+        # Периодическое сохранение: каждые 5 новых запросов
+        if len(self._cache) % 5 == 0:
+            self._save_cache()
+            self._cache_dirty = False
         return result
+
+    # ------------------------------------------------------------------
+    # Pass 1: параллельная классификация шагов (без кандидатов)
+    # ------------------------------------------------------------------
+
+    def classify_step(self, action: str) -> QwenClassifyOutput:
+        """Pass 1: определить step_type и search_keywords для одного шага.
+
+        Не требует списка кандидатов → можно запускать параллельно до Pass 2.
+        Результат кешируется по тексту шага.
+        """
+        cache_key = ("cls", action)
+        cached = self._cache.get(cache_key)
+        if isinstance(cached, QwenClassifyOutput):
+            return cached
+
+        if not self.enabled:
+            return QwenClassifyOutput()
+
+        prompt = f'Action: "{action}"\n\nJSON: {{"step_type": "...", "search_keywords": [...]}}'
+        try:
+            if self._backend == "ollama":
+                raw = self._call_ollama(
+                    prompt,
+                    schema=_CLASSIFY_SCHEMA,
+                    system=_CLASSIFY_SYSTEM,
+                    num_predict=_CLASSIFY_NUM_PREDICT,
+                )
+            elif self._backend == "transformers":
+                # transformers: временно использует то же self._system — TODO
+                raw = self._call_transformers(prompt)
+            else:
+                raw = {}
+            result = QwenClassifyOutput.from_raw(raw)
+        except Exception:
+            result = QwenClassifyOutput()
+
+        with self._cache_lock:
+            self._cache[cache_key] = result
+            self._cache_dirty = True
+            if len(self._cache) % 5 == 0:
+                self._save_cache()
+                self._cache_dirty = False
+        return result
+
+    def batch_classify_steps(
+        self,
+        actions: list[str],
+        n_workers: int = 4,
+    ) -> list[QwenClassifyOutput]:
+        """Pass 1: параллельная классификация всех шагов сценария.
+
+        Вызовы независимы (не используют step_history) → ThreadPoolExecutor.
+        Уже закешированные шаги не требуют вызова Qwen.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results: list[QwenClassifyOutput] = [QwenClassifyOutput()] * len(actions)
+        uncached_indices: list[int] = []
+
+        for i, action in enumerate(actions):
+            cached = self._cache.get(("cls", action))
+            if isinstance(cached, QwenClassifyOutput):
+                results[i] = cached
+            else:
+                uncached_indices.append(i)
+
+        if not uncached_indices or not self.enabled:
+            n_cached = len(actions) - len(uncached_indices)
+            if actions:
+                print(
+                    f"[qwen] classify: {n_cached}/{len(actions)} из кеша",
+                    file=sys.stderr,
+                )
+            return results
+
+        print(
+            f"[qwen] classify: {len(actions) - len(uncached_indices)} из кеша, "
+            f"{len(uncached_indices)} новых (workers={n_workers})",
+            file=sys.stderr,
+        )
+
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = {
+                ex.submit(self.classify_step, actions[i]): i
+                for i in uncached_indices
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception:
+                    pass
+
+        return results
+
+    def flush(self) -> None:
+        """Принудительно сохранить кеш на диск."""
+        if self._cache_dirty:
+            self._save_cache()
+            self._cache_dirty = False
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +612,65 @@ def get_candidate_handlers(
         result[short] = entries
 
     return result
+
+
+def get_candidate_handlers_indexed(
+    oracle: "Oracle",
+    ix,
+    max_per_service: int = 4,
+    max_services: int = 8,
+) -> "tuple[list[tuple[int, str, str]], dict[int, str]]":
+    """Пронумерованный список handler-ов для Qwen index-based selection.
+
+    Returns:
+        display_list  — [(idx, module_short, display_str), ...] для промпта
+        nid_map       — {idx: nid} для прямого инжекта без graph_name_lookup
+    """
+    recent_mods: list[str] = []
+    seen_mods: set[str] = set()
+    for rec in reversed(getattr(oracle, "step_history", [])):
+        for nid in rec.found_handlers:
+            mod = ix.module.get(nid, "")
+            if mod and mod not in seen_mods:
+                recent_mods.append(mod)
+                seen_mods.add(mod)
+        if len(recent_mods) >= 4:
+            break
+
+    reachable_mods: list[str] = []
+    if getattr(oracle, "step_history", None):
+        for mod in sorted(oracle.step_history[-1].reachable_modules):
+            if mod not in seen_mods:
+                reachable_mods.append(mod)
+                seen_mods.add(mod)
+
+    selected = (recent_mods + reachable_mods)[:max_services]
+
+    by_mod: dict[str, list[tuple[str, str, str, str]]] = {}
+    for nid, verb, path_list in ix.handlers:
+        mod = ix.module.get(nid, "")
+        if mod not in selected:
+            continue
+        name = ix.N.get(nid, {}).get("name", "")
+        if not name:
+            continue
+        path_str = path_list[0] if path_list else ""
+        by_mod.setdefault(mod, []).append((nid, name, verb, path_str))
+
+    display_list: list[tuple[int, str, str]] = []
+    nid_map: dict[int, str] = {}
+    idx = 1
+    for mod in selected:
+        if mod not in by_mod:
+            continue
+        short = mod.replace("ts-", "").replace("-service", "")
+        for nid, name, verb, path_str in by_mod[mod][:max_per_service]:
+            display = f"{name} {verb} {path_str}" if verb and path_str else name
+            display_list.append((idx, short, display))
+            nid_map[idx] = nid
+            idx += 1
+
+    return display_list, nid_map
 
 
 # ---------------------------------------------------------------------------

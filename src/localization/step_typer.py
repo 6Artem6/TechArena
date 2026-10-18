@@ -47,10 +47,10 @@ _NOT_G_TRAIN = re.compile(
 _SEAT_FIRST  = re.compile(r"\b(first.?class|business.?class|1st.?class)\b", re.I)
 _SEAT_SECOND = re.compile(r"\b(second.?class|economy|2nd.?class|standard)\b", re.I)
 
-_HAS_FOOD    = re.compile(r"\b(with\s+food|order\s+food|food\s+on\s+the\s+train)\b", re.I)
+_HAS_FOOD    = re.compile(r"\b(with\s+food|order\s+food|food\s+on\s+the\s+train|station\s+food)\b", re.I)
 _NO_FOOD     = re.compile(r"\b(no\s+food|without\s+food)\b", re.I)
-_HAS_INS     = re.compile(r"\b(with\s+insur|insur)\b", re.I)
-_NO_INS      = re.compile(r"\b(no\s+insur|without\s+insur|without.*assur)\b", re.I)
+_HAS_INS     = re.compile(r"\bwith\b.{0,80}\b(assurance|insurance)\b", re.I)
+_NO_INS      = re.compile(r"\b(without|no)\b.{0,80}\b(assurance|insurance)\b", re.I)
 _HAS_LUG     = re.compile(r"\b(with\s+luggage|luggage\s+service|consign)\b", re.I)
 _NO_LUG      = re.compile(r"\b(no\s+luggage|without\s+luggage)\b", re.I)
 
@@ -226,5 +226,15 @@ def _build_extra_tokens(info: StepInfo, action: str = "") -> list[str]:
     # Без этого "record of the order" тянет к consign-service (findByOrderId)
     if info.step_type == "query_insurance":
         tokens.extend(["assurance", "assurance"])
+
+    # update_consign / add_consign: "consignment" в тексте → ['consignment'] ≠ ['consign'] в handler-ах
+    # (updateConsign, insertConsign). Явный "consign" устраняет разрыв без влияния на query_consign.
+    if info.step_type in ("update_consign", "add_consign"):
+        tokens.extend(["consign", "consign"])
+
+    # check_refund: "calculate"×2 — boost ts-cancel-service/calculate над прочими
+    # "refund" из action уже есть в query; "calculate" добавляет прямой сигнал сервиса
+    if info.step_type == "check_refund":
+        tokens.extend(["calculate", "refund"])
 
     return tokens

@@ -268,6 +268,7 @@ def pruned_closure(
     entries: set[str],
     index: Index,
     train_type: str = "",
+    excluded_modules: frozenset[str] = frozenset(),
 ) -> tuple[set, set, set, set]:
     """BFS closure с Oracle-фильтрацией remote_call по типу поезда.
 
@@ -275,6 +276,8 @@ def pruned_closure(
     пропускает remote_call к сиблинг-сервисам неверного типа:
       train_type="G" → пропустить remote к OTHER-сервисам
       train_type="D" → пропустить remote к G-сервисам
+    excluded_modules: пропустить remote_call в эти сервисы (опциональные сервисы,
+    которые не были заказаны в данном сценарии, например ts-food-service).
     """
     seen, edges, remote, data = set(), set(), set(), set()
     st = [(m, index.unit_of(m)) for m in entries if m in index.module]
@@ -294,6 +297,8 @@ def pruned_closure(
             if train_type == "G" and _is_other_service(target_mod):
                 continue
             if train_type == "D" and _is_g_service(target_mod):
+                continue
+            if excluded_modules and target_mod in excluded_modules:
                 continue
             remote.add((m, t))
             st.append((t, index.unit_of(t)))

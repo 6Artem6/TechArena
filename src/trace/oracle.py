@@ -62,7 +62,8 @@ _SEAT_1ST = re.compile(r"\b(first.?class|business.?class|1st.?class)\b", re.I)
 _SEAT_2ND = re.compile(r"\b(second.?class|economy|2nd.?class|standard)\b", re.I)
 _HAS_FOOD = re.compile(r"\b(with\s+food|order\s+food|food\s+service)\b", re.I)
 _NO_FOOD  = re.compile(r"\b(no\s+food|without\s+food)\b", re.I)
-_HAS_INS  = re.compile(r"\b(with\s+insurance|insur)\b", re.I)
+_HAS_INS  = re.compile(r"\bwith\b.{0,80}\b(assurance|insurance)\b", re.I)
+_NO_INS   = re.compile(r"\b(without|no)\b.{0,80}\b(assurance|insurance)\b", re.I)
 _HAS_LUG  = re.compile(r"\b(with\s+luggage|luggage\s+service)\b", re.I)
 
 
@@ -109,7 +110,7 @@ class Oracle:
 
         if _HAS_FOOD.search(text) and not _NO_FOOD.search(text):
             self.has_food = True
-        if _HAS_INS.search(text):
+        if _HAS_INS.search(text) and not _NO_INS.search(text):
             self.has_insurance = True
         if _HAS_LUG.search(text):
             self.has_luggage = True

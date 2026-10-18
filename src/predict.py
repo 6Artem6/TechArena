@@ -25,7 +25,7 @@ from src.core.skeleton_index import Index, load_json              # noqa: E402
 from src.localization.ui_context import ui_context, handler_docs  # noqa: E402
 from src.localization.scorer import Scorer                        # noqa: E402
 from src.enrichment.signatures import build_extra_tokens          # noqa: E402
-from src.localization.searcher import enhanced_ground, set_targets_root, set_corpus, init_code_encoders  # noqa: E402
+from src.localization.searcher import enhanced_ground, set_targets_root, set_corpus, init_code_encoders, flush_qwen_cache, batch_classify_steps  # noqa: E402
 from src.localization.flow_graph import FlowContext  # noqa: E402
 from src.trace.closure import enhanced_closure, pruned_closure    # noqa: E402
 from src.localization.service_classifier import (                 # noqa: E402
@@ -149,6 +149,12 @@ def predict_scenario(
 
         step_log: list | None = [] if viz_scenario is not None else None
 
+        # Pass 1: параллельная Qwen-классификация всех шагов до enhanced_ground.
+        # Результаты кешируются в _STEP_CLASSIFY_CACHE (searcher.py) и используются
+        # внутри enhanced_ground для override step_type + search_keywords.
+        _step_actions = [st.get("action", "") for st in (S.get("steps") or [])]
+        batch_classify_steps(_step_actions)
+
         # Шаг 1: найти entry points с oracle carry-over (P-54: disambiguation для шагов без явного train_type)
         entries = enhanced_ground(_index, _scorer, _files, S, oracle=oracle,
                                   flow_ctx=flow_ctx, explain=explain, viz_log=step_log)
@@ -156,7 +162,46 @@ def predict_scenario(
         # Шаг 2: BFS-замыкание с Oracle Pruner (remote_call фильтрация по train_type)
         # oracle.train_type накоплен через parse_step в enhanced_ground
         train_type = oracle.train_type
-        methods, edges, remote, data = pruned_closure(entries, _index, train_type)
+
+        # Опциональные сервисы: исключить remote_call к сервисам которые в этом
+        # сценарии не использовались (нет food/insurance в booking шагах).
+        # Предотвращает FP remote-рёбра к ts-food-service / ts-assurance-service.
+        _FOOD_MODS = frozenset({
+            "ts-food-service", "ts-food-delivery-service",
+            "ts-train-food-service", "ts-station-food-service",
+        })
+        _INS_MODS = frozenset({"ts-assurance-service"})
+        excluded_modules: frozenset[str] = frozenset()
+        if not oracle.has_food:
+            excluded_modules = excluded_modules | _FOOD_MODS
+        if not oracle.has_insurance:
+            excluded_modules = excluded_modules | _INS_MODS
+
+        # search_transit: entry-handler-ы этих шагов вызывают ОБА сиблинг-сервиса
+        # (transfer search запрашивает все типы поездов), поэтому для них
+        # sibling-фильтрацию отключаем — запускаем отдельный closure без train_type.
+        # Остальные entries продолжают использовать стандартный train_type-фильтр.
+        transit_entries: set[str] = set()
+        for step_rec in oracle.step_history:
+            if step_rec.step_type == "search_transit":
+                transit_entries.update(step_rec.found_handlers)
+
+        if transit_entries and train_type:
+            t_methods, t_edges, t_remote, t_data = pruned_closure(
+                transit_entries, _index, "", excluded_modules)
+            other_entries = entries - transit_entries
+            if other_entries:
+                o_methods, o_edges, o_remote, o_data = pruned_closure(
+                    other_entries, _index, train_type, excluded_modules)
+            else:
+                o_methods, o_edges, o_remote, o_data = set(), set(), set(), set()
+            methods = t_methods | o_methods
+            edges = t_edges | o_edges
+            remote = t_remote | o_remote
+            data = t_data | o_data
+        else:
+            methods, edges, remote, data = pruned_closure(
+                entries, _index, train_type, excluded_modules)
     else:
         train_type = ""
         entries = ground(_index, _scorer, _files, S)
@@ -358,6 +403,8 @@ def main() -> None:
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False)
     print(f"сохранено: {a.out}", file=sys.stderr)
+
+    flush_qwen_cache()
 
     if a.viz and viz_explain:
         _write_viz(viz_explain, Path(a.viz), Path(a.targets))
