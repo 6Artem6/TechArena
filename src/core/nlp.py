@@ -101,6 +101,9 @@ _READ_VERBS = frozenset({
 
 VERB_SYN: dict[str, list[str]] = {
     **{v: ["get", "find", "query"] for v in _READ_VERBS},
+    # "search" → только "query": findBy* = DB-операции, не семантика поиска маршрутов
+    # expand("search")→"find" создавал FP для findByAccountId при поиске поездов
+    "search": ["get", "query"],
     **{
         v: ["create", "add", "new"]
         for v in ("reserve", "create", "add", "register", "place", "submit", "make")

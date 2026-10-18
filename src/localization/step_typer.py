@@ -37,6 +37,13 @@ _OTHER_TRAIN = _build_train_re("OTHER", [
     r"regular", r"'?other'?\s*type", r"non.?high.?speed", r"slow", r"normal\s+train",
 ])
 
+# NOT_G: отрицание high-speed — приоритет над _G_TRAIN (как в oracle.py)
+# Предотвращает false positive: "not high-speed" → train_type=G
+_NOT_G_TRAIN = re.compile(
+    r"(not\s+high.?speed|regular\s+train|other\b.{0,30}\btype)",
+    re.I,
+)
+
 _SEAT_FIRST  = re.compile(r"\b(first.?class|business.?class|1st.?class)\b", re.I)
 _SEAT_SECOND = re.compile(r"\b(second.?class|economy|2nd.?class|standard)\b", re.I)
 
@@ -46,6 +53,11 @@ _HAS_INS     = re.compile(r"\b(with\s+insur|insur)\b", re.I)
 _NO_INS      = re.compile(r"\b(no\s+insur|without\s+insur|without.*assur)\b", re.I)
 _HAS_LUG     = re.compile(r"\b(with\s+luggage|luggage\s+service|consign)\b", re.I)
 _NO_LUG      = re.compile(r"\b(no\s+luggage|without\s+luggage)\b", re.I)
+
+# Оплата: "internal" без признаков external → inside-payment; "external" или "empty balance" → outside-payment.
+_PAY_INTERNAL = re.compile(r"\binternal\b", re.I)
+_PAY_EXTERNAL = re.compile(r"\bexternal\b", re.I)
+_PAY_EMPTY    = re.compile(r"\binternal\b.{0,50}\bempty\b", re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +85,7 @@ def _load_step_rules() -> list[tuple[str, list[str]]]:
         ("cancel",         [r"^cancel\b"]),
         ("rebook",         ["rebook", "change seat", "change ticket", "change the trip"]),
         ("collect",        [r"^collect\b", "pick up", "take the ticket"]),
+        ("enter_station",  [r"enter.+station", r"\bboard.+train", r"\bboard.+order"]),
         ("search_advanced", ["^advanced search", r"cheapest\s+trips", r"quickest\s+trips",
                              "fewest.stop"]),
         ("search_train",   ["search", "find train", "find trip", "trips from",
@@ -121,7 +134,10 @@ def classify(action: str) -> StepInfo:
     info = StepInfo()
 
     # --- Определить train_type ---
-    if _G_TRAIN.search(text):
+    # NOT_G проверяется первым: "not high-speed" не должно давать train_type=G
+    if _NOT_G_TRAIN.search(text):
+        info.train_type = "OTHER"
+    elif _G_TRAIN.search(text):
         info.train_type = "G"
     elif _OTHER_TRAIN.search(text):
         info.train_type = "OTHER"
@@ -158,12 +174,12 @@ def classify(action: str) -> StepInfo:
             break
 
     # --- Сформировать extra_tokens для BM25 ---
-    info.extra_tokens = _build_extra_tokens(info)
+    info.extra_tokens = _build_extra_tokens(info, action)
 
     return info
 
 
-def _build_extra_tokens(info: StepInfo) -> list[str]:
+def _build_extra_tokens(info: StepInfo, action: str = "") -> list[str]:
     """Формирует структурные BM25-токены из параметров бронирования.
 
     Семантический мост NL → code (action vocabulary) заменён dense-векторами
@@ -183,5 +199,32 @@ def _build_extra_tokens(info: StepInfo) -> list[str]:
         tokens.append("insurance")
     if info.has_luggage is True:
         tokens.append("consign luggage")
+
+    # step_type-специфичные токены: усиливают нужный handler в пределах одного сервиса
+    # search_transit: "transfer"×2 + "via" → boost getTransferResult vs queryOrdersForRefresh
+    if info.step_type == "search_transit":
+        tokens.extend(["transfer", "transfer", "via"])
+    # cancel: "ticket" + "verify" → boost cancelTicket (имеет оба) vs calculate (не имеет)
+    if info.step_type == "cancel":
+        tokens.extend(["ticket", "verify"])
+    # rebook: "rebook" x2 extra → triple "rebook" в query; rebook.rebook имеет TF=3 vs payDifference TF=2
+    if info.step_type == "rebook":
+        tokens.extend(["rebook", "rebook"])
+    # pay: "external" или "internal ... empty" → outside-payment; "internal" без этих признаков → inside-payment
+    if info.step_type == "pay":
+        if _PAY_EXTERNAL.search(action) or _PAY_EMPTY.search(action):
+            # "payment service" — семантический сигнал для BGE-M3: ts-payment-service (не inside)
+            tokens.extend(["payment", "payment", "service"])
+        elif _PAY_INTERNAL.search(action):
+            tokens.append("inside")
+
+    # check_price: "price"×2 — усилить сигнал price vs order (queryOrdersForRefresh шумит)
+    if info.step_type == "check_price":
+        tokens.extend(["price", "price"])
+
+    # query_insurance: "assurance"×2 — boost assurance-service vs consign-service
+    # Без этого "record of the order" тянет к consign-service (findByOrderId)
+    if info.step_type == "query_insurance":
+        tokens.extend(["assurance", "assurance"])
 
     return tokens

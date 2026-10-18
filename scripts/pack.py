@@ -42,9 +42,11 @@ USED_FILES: list[str] = [
     "src/core/skeleton_index.py",
     "src/core/walker.py",
 
-    # Similarity: опциональный BGE-M3 semantic reranker
+    # Similarity: опциональный BGE-M3 semantic reranker + CodeBERT code encoder + cross-encoder
     "src/similarity/__init__.py",
     "src/similarity/encoder.py",
+    "src/similarity/code_encoder.py",
+    "src/similarity/cross_encoder.py",
 
     # Graph: обнаружение сиблинг-пар сервисов (G/OTHER disambiguation)
     "src/graph/__init__.py",
@@ -58,6 +60,11 @@ USED_FILES: list[str] = [
     "src/localization/service_matcher.py",
     "src/localization/step_typer.py",
     "src/localization/ui_context.py",
+    "src/localization/hub_scorer.py",
+    "src/localization/session_context.py",
+    "src/localization/flow_graph.py",
+    "src/localization/java_context.py",
+    "src/localization/qwen_encoder.py",
 
     # Parsers: Java AST — только Java-парсер нужен для enrichment
     "src/parsers/__init__.py",

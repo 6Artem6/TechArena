@@ -10,6 +10,7 @@ enhanced_closure() — обёртка над baseline_closure.Index.closure():
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -57,6 +58,61 @@ def _detect_security_filters(index: Index) -> set[str]:
 
     _SECURITY_FILTERS_CACHE = filters
     return filters
+
+
+# ---------------------------------------------------------------------------
+# ORM entity loading: data_access(table) → Entity#<init>()
+#
+# JPA/MongoDB при загрузке строк из БД вызывают no-arg конструктор entity.
+# Статический скелет не знает об этом, но мы можем вывести связь из аннотации
+# @Table(name="tableName") на entity-классах.
+#
+# Алгоритм:
+#   1. Найти типы с @Table(name=X) → получить <init>() этого типа
+#   2. Ключ: res:table:{module}.{tableName}
+#   3. В BFS: когда встречаем data_access(method→table), добавляем <init>() в BFS
+# ---------------------------------------------------------------------------
+
+_TABLE_ENTITY_MAP_CACHE: "dict[str, list[str]] | None" = None
+_TABLE_NAME_RE = re.compile(r'name\s*=\s*["\']([^"\']+)["\']')
+
+
+def _build_table_entity_map(index: Index) -> dict[str, list[str]]:
+    global _TABLE_ENTITY_MAP_CACHE
+    if _TABLE_ENTITY_MAP_CACHE is not None:
+        return _TABLE_ENTITY_MAP_CACHE
+
+    result: dict[str, list[str]] = {}
+    N = index.N
+
+    # type_nid → [<init> method nids]
+    type_to_inits: dict[str, list[str]] = {}
+    for nid, node in N.items():
+        if node.get("kind") != "method" or node.get("name") != "<init>":
+            continue
+        owner = node.get("owner", "")
+        if owner:
+            type_to_inits.setdefault(owner, []).append(nid)
+
+    for type_nid, type_node in N.items():
+        if type_node.get("kind") != "type":
+            continue
+        module = type_node.get("module", "")
+        for ann in type_node.get("annotations", []):
+            if not isinstance(ann, dict) or ann.get("name") != "Table":
+                continue
+            m = _TABLE_NAME_RE.search(ann.get("args", ""))
+            if not m:
+                continue
+            table_key = f"res:table:{module}.{m.group(1)}"
+            inits = type_to_inits.get(type_nid, [])
+            # Keep only no-arg constructors (empty params)
+            no_arg = [i for i in inits if N[i].get("descriptor", "") in ("()V", "") or not N[i].get("params_as_written")]
+            if no_arg:
+                result[table_key] = no_arg
+
+    _TABLE_ENTITY_MAP_CACHE = result
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +232,10 @@ def _apply_di_contracts(
         methods.update(mod_nids)
         for nid in mod_nids:
             for t in index.wiring["data_access"].get(nid, set()):
+                # Пропустить @ElementCollection таблицы (collection_of в schema) —
+                # они добавляются через BFS от primary методов, не от DI-контрактов
+                if "collection_of" in index.N.get(t, {}):
+                    continue
                 data.add((nid, t))
 
     for mod_nids in unconditional.values():
@@ -239,6 +299,10 @@ def pruned_closure(
             st.append((t, index.unit_of(t)))
         for t in index.wiring["data_access"].get(m, set()):
             data.add((m, t))
+            # ORM entity loading: repository.find*() → Entity#<init>()
+            for init_nid in _build_table_entity_map(index).get(t, ()):
+                if (init_nid, u) not in seen:
+                    st.append((init_nid, u))
 
     methods = {m for m, _ in seen}
 
@@ -286,6 +350,29 @@ def enhanced_closure(
     поэтому infra-сервисы полностью обходятся. Нужно фильтровать постфактум.
     """
     methods, edges, remote, data = index.closure(entries)
+
+    # ORM entity loading: для каждой data_access(table) → BFS через Entity#<init>()
+    tbl_map = _build_table_entity_map(index)
+    orm_queue = []
+    for _src, tbl in data:
+        for init_nid in tbl_map.get(tbl, ()):
+            if init_nid not in methods:
+                orm_queue.append(init_nid)
+    if orm_queue:
+        # Mini-BFS внутри сервиса для каждого entity конструктора
+        orm_seen: set[tuple[str, str]] = set()
+        orm_st = [(nid, index.unit_of(nid)) for nid in orm_queue if nid in index.module]
+        while orm_st:
+            m, u = orm_st.pop()
+            if (m, u) in orm_seen:
+                continue
+            orm_seen.add((m, u))
+            methods.add(m)
+            for t in index.calls.get(m, ()):
+                for x in ({t} | index.cha(t)):
+                    if not index.N[x].get("abstract") and u in index.units.get(index.module.get(x), ()):
+                        edges.add((m, x))
+                        orm_st.append((x, u))
 
     # P-101/P-57: Spring Security фильтры (JWT doFilter*)
     for flt in _detect_security_filters(index):

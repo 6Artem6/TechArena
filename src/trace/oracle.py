@@ -14,6 +14,21 @@ from .._config import cfg_get
 
 
 # ---------------------------------------------------------------------------
+# StepRecord — graph-derived контекст одного шага
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StepRecord:
+    """Состояние шага для graph-guided session history."""
+    step_idx: int
+    step_type: str
+    found_handlers: list  # list[str] — nids
+    reachable_nids: set   # set[str] — прямые remote_call-цели
+    reachable_modules: set  # set[str] — module names reachable nids
+    handler_names: list = field(default_factory=list)  # list[str] — "short-mod.methodName"
+
+
+# ---------------------------------------------------------------------------
 # Паттерны типа поезда (из domain_config.yaml → oracle_train_patterns)
 #
 # ВНИМАНИЕ: DongChe трактуется как D-тип (для точного pruning по BFS ветвям).
@@ -68,6 +83,7 @@ class Oracle:
     has_insurance: bool = False
     has_luggage:   bool = False
     active_services: set = field(default_factory=set)
+    step_history: list = field(default_factory=list)  # list[StepRecord]
 
     # ------------------------------------------------------------------
     # Разбор текста шага (Pruner 3a — детерминировано из текста)
@@ -113,10 +129,55 @@ class Oracle:
     def mark_order_cancelled(self) -> None:
         self.order_status = "CANCELLED"
 
+    def mark_order_collected(self) -> None:
+        self.order_status = "COLLECTED"
+
+    def mark_order_executed(self) -> None:
+        self.order_status = "EXECUTED"
+
     def mark_service_active(self, service_name: str) -> None:
         self.active_services.add(service_name)
 
+    def record_step(self, step_idx: int, step_type: str,
+                    found_handlers, wiring: dict, module_map: dict,
+                    calls_map: dict | None = None,
+                    handler_names: "list[str] | None" = None) -> None:
+        """Записать шаг в историю с graph-derived remote_call-соседями.
+
+        Module-level: берём все remote_call-рёбра из модулей найденных handler-ов.
+        Это обходит разрыв controller→interface→impl в skeleton-графе:
+        remote_call-рёбра находятся на уровне impl-методов того же модуля.
+        calls_map сохраняется для будущего использования.
+        """
+        found_list = list(found_handlers)
+        reachable_nids: set = set()
+        reachable_modules: set = set()
+
+        rc_wiring = wiring.get("remote_call", {})
+        found_modules = {module_map.get(nid, "") for nid in found_list} - {""}
+
+        # Все remote_call из модулей найденных handler-ов
+        for src_nid, tgt_nids in rc_wiring.items():
+            src_mod = module_map.get(src_nid, "")
+            if src_mod not in found_modules:
+                continue
+            for tgt_nid in tgt_nids:
+                reachable_nids.add(tgt_nid)
+                m = module_map.get(tgt_nid, "")
+                if m:
+                    reachable_modules.add(m)
+
+        self.step_history.append(StepRecord(
+            step_idx=step_idx,
+            step_type=step_type,
+            found_handlers=found_list,
+            reachable_nids=reachable_nids,
+            reachable_modules=reachable_modules,
+            handler_names=list(handler_names) if handler_names else [],
+        ))
+
     def is_service_active(self, service_name: str) -> bool:
+        """True если сервис был активен в этом сценарии (полная история)."""
         return service_name in self.active_services
 
     # ------------------------------------------------------------------
@@ -143,3 +204,5 @@ class Oracle:
             self.mark_order_cancelled()
         elif step_type == "rebook":
             self.order_status = "INIT"
+        elif step_type == "collect":
+            self.mark_order_collected()

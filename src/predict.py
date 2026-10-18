@@ -25,13 +25,15 @@ from src.core.skeleton_index import Index, load_json              # noqa: E402
 from src.localization.ui_context import ui_context, handler_docs  # noqa: E402
 from src.localization.scorer import Scorer                        # noqa: E402
 from src.enrichment.signatures import build_extra_tokens          # noqa: E402
-from src.localization.searcher import enhanced_ground, set_targets_root, set_corpus  # noqa: E402
+from src.localization.searcher import enhanced_ground, set_targets_root, set_corpus, init_code_encoders  # noqa: E402
+from src.localization.flow_graph import FlowContext  # noqa: E402
 from src.trace.closure import enhanced_closure, pruned_closure    # noqa: E402
 from src.localization.service_classifier import (                 # noqa: E402
     detect_infra_remote,
     precompute_tier2_from_index,
 )
 from src.trace.oracle import Oracle                               # noqa: E402
+from src.enrichment.ast_calls import patch_calls                  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +47,7 @@ _project: str = ""
 
 
 def _build_index(skeleton: Path, targets: Path, enrich: bool = True) -> None:
-    global _index, _scorer, _files, _project, _INFRA_MODULES
+    global _index, _scorer, _files, _project, _INFRA_MODULES, _code_models, _code_gamma
     sk = load_json(str(skeleton))
     _index = Index(sk)
     _project = sk["project"]
@@ -77,6 +79,19 @@ def _build_index(skeleton: Path, targets: Path, enrich: bool = True) -> None:
     # P-93: передать BM25-корпус для обогащения BGE-M3 doc_texts:
     # ui-токены несут "advance" для travel-plan-service, "book" для preserve-service и т.д.
     set_corpus(code, ui)
+
+    # AST patch: дописать рёбра calls из тел методов (конструкторы, enum-поля)
+    n_patched = patch_calls(_index, targets)
+    print(f"AST patch: +{n_patched} call-рёбер из исходников", file=sys.stderr)
+
+    # Code encoders: инициализируем после set_corpus (нужен _DOC_TEXTS из _init_service_matcher)
+    # Вызов здесь через CLI-флаг --code-model
+    if _code_models:
+        # Убедиться что _init_service_matcher уже запустился (лениво, через первый вызов)
+        # Принудительно инициализируем ServiceMatcher сейчас
+        from src.localization.searcher import _init_service_matcher as _ism
+        _ism(_index)
+        init_code_encoders(_code_models, _code_gamma)
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +127,16 @@ def _filter_remote(remote: set, no_remote: bool) -> set:
 # ---------------------------------------------------------------------------
 
 _use_enhanced: bool = True   # False → fallback к baseline ground()
+_code_models: list[str] = []  # model names для code encoders
+_code_gamma: float = 0.3      # вес code encoder в финальной оценке
 
 
-def predict_scenario(S: dict, no_remote: bool = False) -> dict:
+def predict_scenario(
+    S: dict,
+    no_remote: bool = False,
+    explain: bool = False,
+    viz_scenario: dict | None = None,
+) -> dict:
     """Принять сценарий S (dict из scenarios/*.json), вернуть блок edges для submission."""
     sid = S["id"]
 
@@ -122,8 +144,14 @@ def predict_scenario(S: dict, no_remote: bool = False) -> dict:
         # Oracle: создаётся на сценарий, накапливает train_type через carry-over (P-54)
         oracle = Oracle()
 
+        # FlowContext: zero-hardcode граф-трекинг ветки сиблингов (параллельно oracle)
+        flow_ctx = FlowContext(_index)
+
+        step_log: list | None = [] if viz_scenario is not None else None
+
         # Шаг 1: найти entry points с oracle carry-over (P-54: disambiguation для шагов без явного train_type)
-        entries = enhanced_ground(_index, _scorer, _files, S, oracle=oracle)
+        entries = enhanced_ground(_index, _scorer, _files, S, oracle=oracle,
+                                  flow_ctx=flow_ctx, explain=explain, viz_log=step_log)
 
         # Шаг 2: BFS-замыкание с Oracle Pruner (remote_call фильтрация по train_type)
         # oracle.train_type накоплен через parse_step в enhanced_ground
@@ -133,6 +161,7 @@ def predict_scenario(S: dict, no_remote: bool = False) -> dict:
         train_type = ""
         entries = ground(_index, _scorer, _files, S)
         methods, edges, remote, data = enhanced_closure(entries, _index)
+        step_log = None
 
     remote = _filter_remote(remote, no_remote)
 
@@ -143,10 +172,123 @@ def predict_scenario(S: dict, no_remote: bool = False) -> dict:
         file=sys.stderr,
     )
 
+    if viz_scenario is not None and step_log is not None:
+        viz_scenario[sid] = {
+            "stats": {
+                "entries": len(entries),
+                "methods": len(methods),
+                "calls": len(edges),
+                "remote": len(remote),
+                "data": len(data),
+            },
+            "steps": step_log,
+        }
+
     return _index.submission(
         sid, methods, edges, remote, data,
         method="nlp+bm25+taxonomy+oracle",
     )
+
+
+# ---------------------------------------------------------------------------
+# Viz JSON builder для debug_viz.html
+# ---------------------------------------------------------------------------
+
+def _source_key(nid: str) -> str:
+    """method:ts-auth:a.b.C#foo() → ts-auth.a.b.C#foo()"""
+    parts = nid.split(":", 2)
+    return f"{parts[1]}.{parts[2]}" if len(parts) == 3 else nid
+
+
+def _nid_to_key(nid: str) -> str:
+    """Универсальный ключ для любого nid (method или data_resource)."""
+    if nid.startswith("method:"):
+        return _source_key(nid)
+    if nid.startswith("res:table:"):
+        return nid[len("res:table:"):]
+    return nid
+
+
+def _write_viz(viz_explain: dict, viz_path: Path, targets: Path) -> None:
+    """Собрать viz JSON и записать в файл."""
+    source: dict = {}
+
+    # Per-step BFS: populate trace.calls/remote/data
+    for sid, scen in viz_explain.items():
+        for step in scen.get("steps", []):
+            selected_nids = set(step.pop("_selected_nids", []))
+            train_type = step.pop("_train_type", "")
+            if selected_nids:
+                _, step_edges, step_remote, step_data = pruned_closure(
+                    selected_nids, _index, train_type
+                )
+                step["trace"] = {
+                    "calls": list({_nid_to_key(t) for _, t in step_edges}),
+                    "remote": list({_nid_to_key(t) for _, t in step_remote}),
+                    "data": list({_nid_to_key(t) for _, t in step_data}),
+                }
+
+    for sid, scen in viz_explain.items():
+        for step in scen.get("steps", []):
+            for cand in step.get("candidates", []):
+                nid = cand.get("_nid")
+                if not nid:
+                    continue
+                key = _source_key(nid)
+                if key in source:
+                    continue
+                nd = _index.N.get(nid, {})
+                file_rel = nd.get("file", "")
+                line_s = nd.get("line") or 0
+                line_e = nd.get("end") or line_s
+                if not file_rel:
+                    continue
+                fpath = targets / file_rel
+                try:
+                    all_lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+                    src = "".join(all_lines[max(0, line_s - 1):line_e])
+                except OSError:
+                    src = ""
+                source[key] = {"file": file_rel, "line": line_s, "end": line_e, "source": src}
+
+    # Убрать внутренний _nid из кандидатов перед записью
+    clean_explain: dict = {}
+    for sid, scen in viz_explain.items():
+        clean_steps = []
+        for step in scen.get("steps", []):
+            clean_cands = [{k: v for k, v in c.items() if k != "_nid"} for c in step["candidates"]]
+            clean_steps.append({**step, "candidates": clean_cands})
+        clean_explain[sid] = {**scen, "steps": clean_steps}
+
+    # Граф сервисов из remote_call wiring
+    svc_nodes: set[str] = set()
+    svc_links: list[dict] = []
+    seen_links: set[tuple] = set()
+    for sid, scen in clean_explain.items():
+        for step in scen.get("steps", []):
+            for c in step["candidates"]:
+                if c["selected"]:
+                    svc_nodes.add(c["service"])
+    for src_nid, tgts in _index.wiring.get("remote_call", {}).items():
+        src_mod = _index.module.get(src_nid, "")
+        for tgt_nid in tgts:
+            tgt_mod = _index.module.get(tgt_nid, "")
+            if src_mod and tgt_mod and src_mod != tgt_mod:
+                edge = (src_mod, tgt_mod)
+                if edge not in seen_links:
+                    seen_links.add(edge)
+                    svc_links.append({"source": src_mod, "target": tgt_mod})
+                svc_nodes.add(src_mod)
+                svc_nodes.add(tgt_mod)
+
+    graph = {
+        "nodes": [{"id": s, "label": s.replace("ts-", "").replace("-service", "")} for s in sorted(svc_nodes)],
+        "links": svc_links,
+    }
+
+    viz = {"explain": clean_explain, "source": source, "scores": {}, "graph": graph}
+    viz_path.write_text(json.dumps(viz, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"viz сохранён: {viz_path}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -165,22 +307,60 @@ def main() -> None:
     ap.add_argument("--no-enrich",   action="store_true",   help="отключить Фазу 1 (enrichment)")
     ap.add_argument("--no-phase2",   action="store_true",   help="отключить Фазу 2 (enhanced_ground)")
     ap.add_argument("--no-remote",   action="store_true",   help="не предсказывать remote edges")
+    ap.add_argument("--explain",     action="store_true",   help="вывести топ-5 кандидатов для каждого шага")
+    ap.add_argument(
+        "--code-model",
+        action="append",
+        dest="code_models",
+        default=[],
+        metavar="MODEL",
+        help=(
+            "добавить code encoder (можно несколько раз). "
+            "Примеры: microsoft/codebert-base, microsoft/graphcodebert-base"
+        ),
+    )
+    ap.add_argument(
+        "--code-gamma",
+        type=float,
+        default=0.3,
+        metavar="GAMMA",
+        help="вес code encoder в финальной оценке (default: 0.3)",
+    )
+    ap.add_argument(
+        "--viz",
+        metavar="VIZ_FILE",
+        help="сохранить debug JSON для debug_viz.html (например viz.json)",
+    )
     a = ap.parse_args()
 
-    global _use_enhanced
+    global _use_enhanced, _code_models, _code_gamma
     _use_enhanced = not a.no_phase2
+    _code_models = a.code_models
+    _code_gamma = a.code_gamma
 
     _build_index(Path(a.skeleton), Path(a.targets), enrich=not a.no_enrich)
+
+    viz_explain: dict | None = {} if a.viz else None
 
     out: dict = {"project": _project, "scenarios": {}}
     for path in a.scenarios:
         S = load_json(path)
         sid = S["id"]
-        out["scenarios"][sid] = predict_scenario(S, no_remote=a.no_remote)
+        if a.explain:
+            print(f"=== {sid} ===")
+        out["scenarios"][sid] = predict_scenario(
+            S,
+            no_remote=a.no_remote,
+            explain=a.explain,
+            viz_scenario=viz_explain,
+        )
 
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False)
     print(f"сохранено: {a.out}", file=sys.stderr)
+
+    if a.viz and viz_explain:
+        _write_viz(viz_explain, Path(a.viz), Path(a.targets))
 
 
 if __name__ == "__main__":

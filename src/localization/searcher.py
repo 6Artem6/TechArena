@@ -24,6 +24,12 @@ from src.localization.service_matcher import ServiceMatcher  # noqa: E402
 from src.graph.siblings import detect_all_siblings, _strip  # noqa: E402
 from src.trace.oracle import Oracle  # noqa: E402
 from src.similarity.encoder import SemanticReranker  # noqa: E402
+from src.similarity.code_encoder import CodeEncoder  # noqa: E402
+from src.similarity.cross_encoder import CrossEncoder  # noqa: E402
+from src.localization.hub_scorer import precompute_reachability, rerank_by_hub  # noqa: E402
+from src.localization.session_context import SessionContext  # noqa: E402
+from src.localization.java_context import build_java_context, build_nl_enrichment  # noqa: E402
+from src.localization.qwen_encoder import QwenEncoder, get_candidate_handlers, graph_name_lookup  # noqa: E402
 
 
 # Типы шагов, которые наследуют train_type из предыдущего шага через oracle carry-over.
@@ -49,29 +55,38 @@ _SERVICE_MATCHER: ServiceMatcher | None = None
 # Путь к targets/ (корень исходников). Устанавливается из predict._build_index().
 _TARGETS_ROOT: "Path | None" = None
 
-# SemanticReranker — BGE-M3 для параллельного сравнения с BM25 (не заменяет)
+# SemanticReranker — BGE-M3 bi-encoder (этап 1 гибридного пайплайна)
 _RERANKER: "SemanticReranker | None" = None
-# Текстовые описания обработчиков для dense-кодирования {handler_id → text}
+# CrossEncoder — bge-reranker-base (этап 2: joint cross-attention, top-20)
+_CROSS_ENCODER: "CrossEncoder | None" = None
+# Текстовые описания обработчиков для dense/cross кодирования {handler_id → text}
 _DOC_TEXTS: "dict[str, str] | None" = None
+# CE-специфичный doc_text: verb+path+name + javadoc + logger msgs + соседи класса
+_CE_DOC_TEXTS: "dict[str, str] | None" = None
+
+# Code encoders: CodeBERT / GraphCodeBERT (дополнительный сигнал поверх BM25+BGE-M3)
+_CODE_ENCODERS: "list[tuple[CodeEncoder, float]]" = []  # [(encoder, gamma), ...]
+
+# Qwen2.5-Coder query decomposer (ollama, локальный)
+_QWEN_ENCODER: "QwenEncoder | None" = None
 
 # Корпус BM25 (code + ui) — передаётся из predict._build_index() для обогащения doc_texts
 _CODE_DOCS: "dict[str, list[str]] | None" = None
 _UI_DOCS:   "dict[str, list[str]] | None" = None
 
-# Токены без семантики: java/инфра термины, стоп-слова для doc_texts BGE-M3
-_DOC_STOPWORDS: frozenset[str] = frozenset({
-    "null", "fail", "false", "true", "error", "empty", "get", "set",
-    "new", "from", "for", "not", "and", "something", "log", "logger",
-    "return", "else", "api", "http", "header", "string", "object",
-    "class", "edu", "fudan", "org", "springframework",
-})
+# _internal_type_names: простые имена типов из скелета проекта.
+# Вычисляется лениво при первой инициализации SemanticReranker.
+# Заменяет _PARAM_STOPWORDS и _DOC_STOPWORDS — граф сам знает что внутреннее.
+_internal_type_names: frozenset[str] = frozenset()
 
-# Типы параметров без семантики (инфра/java stdlib)
-_PARAM_STOPWORDS: frozenset[str] = frozenset({
-    "HttpHeaders", "HttpServletRequest", "HttpServletResponse",
-    "Principal", "String", "Long", "Integer", "Boolean",
-    "Object", "List", "Map", "ResponseEntity", "HttpEntity",
-})
+
+def _build_internal_type_names(ix) -> frozenset[str]:
+    """Простые имена всех type-узлов проекта из скелета (без дженериков)."""
+    result: set[str] = set()
+    for v in ix.N.values():
+        if v.get("kind") == "type" and v.get("fqn"):
+            result.add(v["fqn"].split(".")[-1])
+    return frozenset(result)
 
 
 def set_targets_root(root) -> None:
@@ -95,13 +110,47 @@ def set_corpus(code_docs: dict, ui_docs: dict) -> None:
     _UI_DOCS = ui_docs
 
 
+def init_code_encoders(model_names: list[str], gamma: float = 0.3) -> None:
+    """Инициализировать code encoders (CodeBERT/GraphCodeBERT).
+
+    Вызывать из predict._build_index() после set_corpus(), чтобы _DOC_TEXTS был готов.
+    model_names: список model_name-ов HuggingFace для загрузки.
+    gamma: вес code encoder в финальной оценке (0 = без влияния, 0.3 = 30%).
+    """
+    global _CODE_ENCODERS
+    if not model_names:
+        return
+    # Убедиться, что _DOC_TEXTS построены (нужен _init_service_matcher)
+    # code encoders инициализируются ПОСЛЕ _init_service_matcher
+    _CODE_ENCODERS = []
+    for mname in model_names:
+        enc = CodeEncoder(mname)
+        if enc.enabled and _DOC_TEXTS:
+            enc.precompute(_DOC_TEXTS)
+            _CODE_ENCODERS.append((enc, gamma))
+            import sys as _sys
+            print(
+                f"[searcher] CodeEncoder [{mname.split('/')[-1]}] готов, gamma={gamma}",
+                file=_sys.stderr,
+            )
+        else:
+            import sys as _sys
+            print(
+                f"[searcher] CodeEncoder [{mname}] недоступен или нет doc_texts",
+                file=_sys.stderr,
+            )
+
+
 def _init_service_matcher(ix) -> None:
     """P-93/P-106: лениво строит ServiceMatcher и SemanticReranker из кода скелета."""
-    global _SERVICE_MATCHER, _RERANKER, _DOC_TEXTS
+    global _SERVICE_MATCHER, _RERANKER, _CROSS_ENCODER, _DOC_TEXTS, _CE_DOC_TEXTS, _internal_type_names
     if _SERVICE_MATCHER is not None:
         return
     modules = set(ix.module.values())
     _SERVICE_MATCHER = ServiceMatcher(modules, ix, root=_TARGETS_ROOT)
+
+    # Внутренние типы из скелета — заменяет ручные _PARAM_STOPWORDS и _DOC_STOPWORDS
+    _internal_type_names = _build_internal_type_names(ix)
 
     # SemanticReranker: построить doc_texts и инициализировать BGE-M3
     _RERANKER = SemanticReranker()
@@ -109,9 +158,9 @@ def _init_service_matcher(ix) -> None:
         import sys as _sys
         from math import log as _log
 
-        # TF-IDF: вычислить IDF токенов по всему corpus для фильтрации
-        # Добавляем в doc_text только domain-специфичные токены (высокий IDF).
-        # Общие токены ("account", "order", "trip") встречаются везде → низкий IDF → не добавляем.
+        # TF-IDF: вычислить IDF токенов по всему corpus для фильтрации.
+        # High-frequency токены ("get", "set", "edu", "null") имеют высокий df → IDF≈0 →
+        # автоматически отфильтровываются _is_informative без ручного списка стоп-слов.
         _all_nids = [nid for nid, _, _ in ix.handlers]
         _df: dict[str, int] = {}
         for _nid in _all_nids:
@@ -119,8 +168,7 @@ def _init_service_matcher(ix) -> None:
             for _src in (_CODE_DOCS, _UI_DOCS):
                 if _src is not None:
                     _tok_set.update(
-                        t for t in _src.get(_nid, [])
-                        if t not in _DOC_STOPWORDS and len(t) > 2
+                        t for t in _src.get(_nid, []) if len(t) > 2
                     )
             for _tok in _tok_set:
                 _df[_tok] = _df.get(_tok, 0) + 1
@@ -131,6 +179,10 @@ def _init_service_matcher(ix) -> None:
         def _is_informative(tok: str) -> bool:
             idf = _log(_N / max(_df.get(tok, 1), 1))
             return idf >= _IDF_THRESHOLD
+
+        # NL-обогащение из Java source (de-bracketed logger content + flow steps).
+        # Вычисляется до основного цикла; в цикле фильтруется через _is_informative.
+        _nl_enrich = build_nl_enrichment(ix, _TARGETS_ROOT)
 
         texts: dict[str, str] = {}
         for nid, verb, tpl in ix.handlers:
@@ -146,34 +198,63 @@ def _init_service_matcher(ix) -> None:
             base = f"{verb} {path} {name} {class_simple} {module}".strip()
 
             # Обогащение: только domain-специфичные токены из code_doc (TF-IDF фильтрация)
-            # code_doc = flow_steps + logger_tags из исходников (enrichment).
-            # UI-токены не используются: они содержат много общего Angular-кода
-            # который не различает сервисы (boosting contacts для consign-запросов и т.п.).
             extra_parts: list[str] = []
             seen: set[str] = set(toks(base))
             if _CODE_DOCS is not None:
                 for tok in _CODE_DOCS.get(nid, []):
-                    if (tok not in _DOC_STOPWORDS and len(tok) > 2
-                            and tok not in seen and _is_informative(tok)):
+                    if len(tok) > 2 and tok not in seen and _is_informative(tok):
                         extra_parts.append(tok)
                         seen.add(tok)
 
-            # Типы параметров: DTO-типы как семантический сигнал (без инфра-типов)
+            # Типы параметров: только internal domain-типы из скелета (не инфра)
             for param in node.get("params_as_written", []):
-                if param not in _PARAM_STOPWORDS:
+                simple = param.split(".")[-1].split("<")[0].strip()
+                if simple in _internal_type_names:
                     for tok in toks(param):
-                        if (tok not in _DOC_STOPWORDS and tok not in seen
-                                and len(tok) > 2 and _is_informative(tok)):
+                        if len(tok) > 2 and tok not in seen and _is_informative(tok):
                             extra_parts.append(tok)
                             seen.add(tok)
 
-            texts[nid] = (base + " " + " ".join(extra_parts[:20])).strip()
+            # Java NL semantic enrichment: de-bracketed logger content + flow step words.
+            # Добавляет domain NL vocabulary (напр. "transit", "inbound", "detail") в BGE-M3 doc.
+            for nl_tok in _nl_enrich.get(nid, []):
+                if len(nl_tok) > 2 and nl_tok not in seen and _is_informative(nl_tok):
+                    extra_parts.append(nl_tok)
+                    seen.add(nl_tok)
+
+            texts[nid] = (base + " " + " ".join(extra_parts[:25])).strip()
 
         _DOC_TEXTS = texts
         print(
             f"[searcher] SemanticReranker готов, doc_texts={len(texts)} обработчиков",
             file=_sys.stderr,
         )
+
+    # CrossEncoder: bge-reranker-base — joint cross-attention поверх BGE-M3 кандидатов
+    _CROSS_ENCODER = CrossEncoder()
+    if _CROSS_ENCODER.enabled:
+        import sys as _sys2
+        print("[searcher] CrossEncoder bge-reranker-base готов", file=_sys2.stderr)
+
+    # CE doc_texts: иерархический контекст из Java исходников (сервис → класс → метод).
+    # Включает javadoc, logger messages, flow_steps, соседей класса.
+    # Объединяется с _DOC_TEXTS (verb+path+name) для CE — богаче BM25 doc_texts.
+    java_ctx = build_java_context(ix, _TARGETS_ROOT)
+    base_texts = _DOC_TEXTS or {}
+    _CE_DOC_TEXTS = {
+        nid: (base_texts.get(nid, '') + ' ' + java_ctx.get(nid, '')).strip()
+        for nid in set(list(base_texts) + list(java_ctx))
+    }
+    import sys as _sys3
+    print(
+        f"[searcher] CE doc_texts: {len(java_ctx)} handlers enriched with Java context",
+        file=_sys3.stderr,
+    )
+
+    # Qwen2.5-Coder: пробует ollama → transformers → disabled
+    # targets_root передаётся для определения языка проекта из файловых расширений
+    global _QWEN_ENCODER
+    _QWEN_ENCODER = QwenEncoder(targets_root=_TARGETS_ROOT)
 
 
 def _is_g_side(a: str, b: str, reason: str) -> bool:
@@ -332,33 +413,112 @@ def _is_plan_func_service(module: str) -> bool:
     return entry is not None and not entry[1]
 
 
-def _disambiguate_func_variant(hs: set[str], step_type: str, ix) -> set[str]:
+def _disambiguate_func_variant(hs: set[str], step_type: str, ix, ranked: list | None = None) -> set[str]:
     """P-75: func-variant disambiguation по step_type (basic vs plan).
 
-    search_train  → убрать plan-сторону (travel-plan, route-plan)
-    search_advanced → убрать basic-сторону (travel, route)
-    Оба присутствуют в hs → убираем не нужный.
-    Только один → оставляем без изменений (консервативно).
+    search_train  → убрать plan-сторону (travel-plan, route-plan); force-swap если только plan в hs
+    search_advanced → убрать basic-сторону; force-swap если только basic в hs
     """
     if step_type not in _BASIC_SEARCH_TYPES and step_type not in _PLAN_SEARCH_TYPES:
         return hs
 
-    to_remove: set[str] = set()
+    want_basic = step_type in _BASIC_SEARCH_TYPES  # True = хотим basic, убрать plan
+
+    result = set(hs)
     for h in hs:
         mod = ix.module.get(h, "")
         sibling_mod = _func_sibling_of(mod)
         if sibling_mod is None:
             continue
-        # Оба сиблинга в hs → disambiguation применима
-        if not any(ix.module.get(h2) == sibling_mod for h2 in hs):
-            continue
+        is_plan = _is_plan_func_service(mod)
+        is_basic = _is_basic_func_service(mod)
 
-        if step_type in _BASIC_SEARCH_TYPES and _is_plan_func_service(mod):
-            to_remove.add(h)
-        elif step_type in _PLAN_SEARCH_TYPES and _is_basic_func_service(mod):
-            to_remove.add(h)
+        if want_basic and is_plan:
+            # Хотим basic, но в hs — plan side
+            sibling_in_hs = any(ix.module.get(h2) == sibling_mod for h2 in hs)
+            if sibling_in_hs:
+                # Оба в hs → просто убрать plan
+                result.discard(h)
+            elif ranked is not None:
+                # Только plan в hs → force-swap: найти basic-side handler в ranked
+                for _, h2 in ranked:
+                    if ix.module.get(h2) == sibling_mod:
+                        result.discard(h)
+                        result.add(h2)
+                        break
+        elif not want_basic and is_basic:
+            # Хотим plan, но в hs — basic side
+            sibling_in_hs = any(ix.module.get(h2) == sibling_mod for h2 in hs)
+            if sibling_in_hs:
+                result.discard(h)
+            elif ranked is not None:
+                for _, h2 in ranked:
+                    if ix.module.get(h2) == sibling_mod:
+                        result.discard(h)
+                        result.add(h2)
+                        break
 
-    return hs - to_remove if to_remove else hs
+    return result
+
+
+# Таблица: step_type → глагол-ключ в имени метода.
+# Для cancel/rebook/register: предпочитаем handler чьё имя содержит этот глагол.
+_STEP_TYPE_VERB: dict[str, str] = {
+    "cancel": "cancel",
+    "rebook": "rebook",
+    "register": "register",
+}
+
+
+def _prefer_step_typed_handler(
+    hs: set[str], step_type: str, ix, ranked: list
+) -> set[str]:
+    """Предпочесть handler с именем, содержащим глагол шага.
+
+    Для cancel/rebook: если в tau-window несколько handler'ов одного модуля
+    и один из них содержит verb в имени метода → оставить только его.
+    Если typed handler вне tau-window → принудительно добавить из ranked
+    (force-swap), убрав нетипизированный.
+
+    Примеры:
+      cancel step → cancelTicket (vs calculate) — cancelTicket имеет "cancel"
+      rebook step → rebook.rebook (vs payDifference) — rebook.rebook имеет "rebook"
+    """
+    verb = _STEP_TYPE_VERB.get(step_type, "")
+    if not verb or not hs:
+        return hs
+
+    by_mod: dict[str, list[str]] = {}
+    for h in hs:
+        by_mod.setdefault(ix.module.get(h, ""), []).append(h)
+
+    result = set(hs)
+    for mod, handlers in by_mod.items():
+        typed   = [h for h in handlers if verb in ix.N.get(h, {}).get("name", "").lower()]
+        untyped = [h for h in handlers if verb not in ix.N.get(h, {}).get("name", "").lower()]
+
+        if typed:
+            # Typed handler уже в окне → убрать нетипизированных из того же модуля
+            for h in untyped:
+                result.discard(h)
+        elif untyped:
+            # Typed handler вне tau-window → force-swap из ranked (сначала тот же модуль, затем любой)
+            found = False
+            for _, h2 in ranked:
+                if (ix.module.get(h2) == mod
+                        and verb in ix.N.get(h2, {}).get("name", "").lower()):
+                    for h in untyped: result.discard(h)
+                    result.add(h2)
+                    found = True
+                    break
+            if not found:
+                # Если verb нет в текущем модуле → ищем в любом модуле ranked (cross-module swap)
+                for _, h2 in ranked:
+                    if verb in ix.N.get(h2, {}).get("name", "").lower():
+                        for h in untyped: result.discard(h)
+                        result.add(h2)
+                        break
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +536,8 @@ def enhanced_ground(
     admin_pen: float = 0.5,
     explain: bool = False,
     oracle: Oracle | None = None,
+    flow_ctx=None,
+    viz_log: list | None = None,
 ) -> set[str]:
     """Улучшенный entry point поиск.
 
@@ -384,6 +546,7 @@ def enhanced_ground(
     # Инициализировать кеши при первом вызове
     _init_sibling_map(ix)
     _init_service_matcher(ix)  # P-93/P-106: ServiceMatcher из кода скелета
+    _hub_reachable = precompute_reachability(ix)
 
     # Начальный admin-контекст: из title/description сценария
     _title_desc = S.get("title", "") + " " + S.get("description", "")
@@ -391,7 +554,10 @@ def enhanced_ground(
     entries, prev_files, touched = set(), set(), set()
     log = []
 
-    for st in S.get("steps") or []:
+    # Сессионный контекст: NLP-обогащение BM25-запросов на основе истории шагов
+    session_ctx = SessionContext()
+
+    for step_idx, st in enumerate(S.get("steps") or []):
         act = st.get("action") or ""
 
         # --- Шаг 1: базовые токены из action ---
@@ -411,10 +577,18 @@ def enhanced_ground(
         # Пример: "As the administrator, open the list of all orders"
         step_is_admin = is_admin or bool(ADMIN & set(toks(act)))
 
-        if step_info.extra_tokens:
-            # Добавляем токенизированные версии extra_tokens к запросу
-            for extra in step_info.extra_tokens:
+        # --- Сессионный контекст: обогащение BM25-запроса историей шагов ---
+        ctx_tokens = session_ctx.context_tokens(step_info.step_type, step_info, act)
+        session_ctx.update(step_info.step_type, step_info, act)
+
+        # act_extended: action + extra_tokens — передаётся в BGE-M3 reranker
+        # чтобы semantic scoring тоже учитывал structural disambiguation tokens.
+        act_extended = act
+        all_extra = step_info.extra_tokens + ctx_tokens
+        if all_extra:
+            for extra in all_extra:
                 q = q + toks(extra)
+            act_extended = act + " " + " ".join(all_extra)
 
         # Убрать "contact" из запросов бронирования/оплаты/отмены:
         # в этих шагах "contact" = имя человека, не сервис.
@@ -430,17 +604,61 @@ def enhanced_ground(
         if step_info.step_type == "query_consign":
             q = [t for t in q if t not in frozenset(["order", "orders"])]
 
+        # Для external pay: "internal balance is empty" → убрать "internal"/"inside"/"balance"
+        # чтобы не буcтить ts-inside-payment-service; нужен ts-payment-service
+        if step_info.step_type == "pay" and any(t in ("payment", "service") for t in step_info.extra_tokens):
+            q = [t for t in q if t not in frozenset(["internal", "inside", "balance"])]
+
         # --- P-93/P-106 online: domain augmentation через ServiceMatcher ---
         # BM25 по коду сервисов находит лучший кандидат → добавляет его
         # code-токены к запросу (аддитивно, не заменяет action vocab токены).
-        if _SERVICE_MATCHER is not None:
+        # Для поисковых шагов ServiceMatcher шумит (выбирает cancel вместо travel) → пропускаем.
+        # Для поисковых шагов ServiceMatcher шумит или выбирает не тот сервис → пропускаем.
+        _SEARCH_STEP_TYPES = frozenset({"search_train", "search_advanced", "search_transit"})
+        if _SERVICE_MATCHER is not None and step_info.step_type not in _SEARCH_STEP_TYPES:
             domain_extras = _SERVICE_MATCHER.augment(q)
             if domain_extras:
                 q = q + domain_extras
 
+        # --- Qwen query decomposition → graph-guided name injection ---
+        # Стратегия: Qwen генерирует QwenOutput (Pydantic) →
+        #   bm25 токены → валидация против кандидатов →
+        #   graph_name_lookup: прямой поиск handler-а по имени.
+        #   query → BGE-M3 если confidence достаточно (C).
+        # Инжект только при confidence >= MIN_CONFIDENCE.
+        from src.localization.qwen_encoder import _MIN_CONFIDENCE  # noqa: PLC0415
+        _bge_query = act_extended
+        _qwen_valid_bm25: list[str] = []  # validated tokens для graph lookup после ranking
+        _qwen_result = None
+        if _QWEN_ENCODER is not None and _QWEN_ENCODER.enabled and oracle is not None:
+            _cands = get_candidate_handlers(oracle, ix)
+            _qwen_result = _QWEN_ENCODER.decompose(act, oracle.step_history, _cands)
+            if _qwen_result.bm25 and _qwen_result.confidence >= _MIN_CONFIDENCE:
+                # Валидация: оставить только токены ≥8 символов, совпадающие с именами кандидатов
+                # Кандидаты теперь могут быть "handlerName VERB /path" → берём первое слово
+                _all_cand_names = [
+                    n.lower().split()[0]  # первое слово (имя метода без verb/path)
+                    for ns in _cands.values() for n in ns
+                ]
+                for _tok in _qwen_result.bm25:
+                    _tok_l = _tok.lower()
+                    if len(_tok_l) >= 8 and any(_tok_l in n or n in _tok_l for n in _all_cand_names):
+                        _qwen_valid_bm25.append(_tok_l)
+            # Qwen-query → BGE-M3: НЕ используем — Qwen query слишком специфичен,
+            # дропает общие handler-ы в других сервисах → регрессия на S2/S5/S7.
+            # _bge_query остаётся act_extended всегда.
+
         # --- Oracle carry-over: обновить oracle из текста шага (P-54) ---
         if oracle is not None:
             oracle.parse_step(act)
+            oracle.update_from_step_type(step_info.step_type)
+
+        # External pay: нужен и inside-payment И external payment service в entry points
+        _is_external_pay = (
+            step_info.step_type == "pay"
+            and any(t in ("payment", "service") for t in step_info.extra_tokens)
+            and not any(t == "inside" for t in step_info.extra_tokens)
+        )
 
         # --- Шаг 3: ранжирование ---
         ranked = []
@@ -464,14 +682,69 @@ def enhanced_ground(
         # Если модель недоступна — ranked остаётся BM25-only (прозрачный fallback).
         semantic_top3: list[tuple[float, str]] = []
         if _RERANKER is not None and _RERANKER.enabled and _DOC_TEXTS is not None:
-            ranked = _RERANKER.rerank(act, ranked[:20], _DOC_TEXTS, alpha=0.5)
+            ranked = _RERANKER.rerank(_bge_query, ranked[:20], _DOC_TEXTS, alpha=0.5)
             semantic_top3 = ranked[:3]
+
+        # --- Code encoder reranking: CodeBERT/GraphCodeBERT поверх BM25+BGE-M3 ---
+        for _ce, _gamma in _CODE_ENCODERS:
+            ranked = _ce.rerank(act, ranked, gamma=_gamma)
+
+        # --- Cross-encoder reranking: bge-reranker-base joint cross-attention ---
+        # Этап 3 пайплайна: видит (query, doc) вместе → лучше различает
+        # "cancel" ↔ "cancelTicket" vs "calculatePrice", "rebook" vs "book".
+        # _CE_DOC_TEXTS: verb+path+name + javadoc + logger msgs + class neighbors.
+        _ce_docs = _CE_DOC_TEXTS if _CE_DOC_TEXTS is not None else _DOC_TEXTS
+        if _CROSS_ENCODER is not None and _CROSS_ENCODER.enabled and _ce_docs is not None:
+            ranked = _CROSS_ENCODER.rerank(act, ranked, _ce_docs, top_k=20, alpha=0.3)
+
+        # --- Graph flow boost (zero-hardcode: topology-based branch consistency) ---
+        if flow_ctx is not None:
+            ranked = [(sc + flow_ctx.boost(h, ix), h) for sc, h in ranked]
+            ranked.sort(reverse=True)
+
+        # view_trip с известным oracle.train_type: расширить tau-окно, чтобы travel service
+        # попал в hs несмотря на высокий score preserve-service (vocabulary перекрытие в BGE-M3).
+        # preserve-service доминирует ~0.85, travel2 ~0.80: стандартный tau=0.05 → порог 0.8075
+        # (travel2 вылетает). tau=0.08 → порог 0.782 → travel2 входит.
+        _step_tau = tau
+        if step_info.step_type == "view_trip" and oracle is not None and oracle.train_type:
+            _step_tau = min(tau + 0.03, 0.10)
 
         # --- Шаг 4: top + tau window ---
         hs: set[str] = set()
         if ranked:
             best = ranked[0][0]
-            hs = {h for sc, h in ranked if sc >= best * (1 - tau)}
+            hs = {h for sc, h in ranked if sc >= best * (1 - _step_tau)}
+
+        # --- Continuity: active service handlers с расширенным tau-окном ---
+        # Oracle.active_services накапливается по шагам: book → pay → cancel/collect
+        # используют те же order-сервисы. Handlers из active services получают
+        # расширенный порог best*(1-tau*2), чтобы не потерять continuity-сервис
+        # если он чуть ниже стандартного tau-окна.
+        # Важно: continuity использует базовый tau (не _step_tau), чтобы tau-widening
+        # для view_trip не ослаблял continuity-фильтр.
+        if oracle is not None and ranked:
+            best = ranked[0][0]
+            continuity_threshold = best * (1.0 - tau * 2)
+            for sc, h in ranked:
+                if sc < continuity_threshold:
+                    break
+                if h in hs:
+                    continue
+                h_svc = ix.module.get(h, "")
+                if h_svc and oracle.is_service_active(h_svc):
+                    hs.add(h)
+
+        # --- enter_station: force-add execute-service handler ---
+        # "board the train" / "enter the station" — vocabulary не пересекается с
+        # кодом ("ticketExecute", "executeOrder"). step_type == "enter_station" →
+        # гарантированно нужен execute-service; берём лучший handler из ranked.
+        if step_info.step_type == "enter_station" and ranked:
+            for _sc, _h in ranked:
+                _h_svc = ix.module.get(_h, "")
+                if _h_svc and "execute" in _h_svc:
+                    hs.add(_h)
+                    break
 
         # --- Шаг 5: disambiguation travel/order по train_type ---
         # carry-over: шаги из _STEP_TYPES_USE_CONTEXT наследуют train_type из oracle
@@ -487,37 +760,7 @@ def enhanced_ground(
         # P-75: func-variant disambiguation (basic ↔ plan) по step_type.
         # search_train → убрать plan-сторону (travel-plan-service и др.)
         # search_advanced → убрать basic-сторону (travel-service и др.)
-        hs = _disambiguate_func_variant(hs, step_info.step_type, ix)
-
-        # Func-variant force-swap: когда только неправильная сторона в hs
-        # (правильная ниже tau-окна) — заменить на лучший обработчик правильного сиблинга.
-        # search_train: travel-plan в окне, travel вне → swap на travel.
-        # search_advanced: travel в окне, travel-plan вне → swap на travel-plan.
-        if (step_info.step_type in _BASIC_SEARCH_TYPES
-                or step_info.step_type in _PLAN_SEARCH_TYPES) and hs:
-            swapped_fv: set[str] = set(hs)
-            for h in list(hs):
-                mod = ix.module.get(h, "")
-                sibling_mod = _func_sibling_of(mod)
-                if sibling_mod is None:
-                    continue
-                # Оба уже в hs — _disambiguate_func_variant уже справился
-                if any(ix.module.get(h2) == sibling_mod for h2 in hs):
-                    continue
-                # Это неправильная сторона?
-                wrong = (
-                    (step_info.step_type in _BASIC_SEARCH_TYPES and _is_plan_func_service(mod))
-                    or (step_info.step_type in _PLAN_SEARCH_TYPES and _is_basic_func_service(mod))
-                )
-                if not wrong:
-                    continue
-                # Найти лучший обработчик правильного сиблинга в ranked
-                for _, h2 in ranked:
-                    if ix.module.get(h2) == sibling_mod:
-                        swapped_fv.discard(h)
-                        swapped_fv.add(h2)
-                        break
-            hs = swapped_fv
+        hs = _disambiguate_func_variant(hs, step_info.step_type, ix, ranked)
 
         # Sibling force-swap: если train_type известен, но в hs только неправильный
         # сиблинг (второй вне tau-окна) — заменить на правильный из ranked.
@@ -546,6 +789,23 @@ def enhanced_ground(
                         break
             hs = swapped
 
+        # cancel/rebook: предпочесть handler с именем-глаголом шага
+        # (cancelTicket vs calculate, rebook.rebook vs rebook.payDifference).
+        # Вызывается до top-1 per module: меняет состав hs, не только порядок.
+        hs = _prefer_step_typed_handler(hs, step_info.step_type, ix, ranked)
+
+        # External pay: добавить best handler из external payment service в entry points.
+        # Оба и inside-payment И external payment участвуют в execution trace
+        # (inside вызывается всегда; external добавляется при external channel).
+        if _is_external_pay:
+            _ext_mods = {ix.module.get(h, "") for h in hs}
+            for _, h2 in ranked:
+                mod2 = ix.module.get(h2, "")
+                # Искать payment service без "inside" который ещё не в hs
+                if "payment" in mod2 and "inside" not in mod2 and mod2 not in _ext_mods:
+                    hs.add(h2)
+                    break
+
         # Top-1 per module: один шаг сценария = один HTTP-вызов к каждому сервису
         # → оставить только top-1 handler per module в tau-окне.
         # Убирает дубликаты одного сервиса (напр. findContactsByAccountId + getContactsByContactsId).
@@ -560,6 +820,62 @@ def enhanced_ground(
                     best_per_mod[mod] = h
             hs = set(best_per_mod.values())
 
+        # --- Qwen graph-name injection: заменить top-1 в модуле на Qwen-найденный handler ---
+        # Условие: есть step_history (не первый шаг) + валидные Qwen bm25-токены
+        # Валидные токены: ≥8 символов, совпадают с именами кандидатов (проверено выше)
+        if _qwen_valid_bm25 and hs and oracle is not None and oracle.step_history:
+            _active = set(getattr(oracle, "active_services", set()))
+            _reach = oracle.step_history[-1].reachable_modules if oracle.step_history else set()
+            _g_matched = graph_name_lookup(_qwen_valid_bm25, ix, _active, _reach)
+            if _g_matched:
+                # Лексический фильтр: хотя бы одно слово ≥6 букв из оригинального
+                # имени handler-а должно присутствовать в тексте action.
+                # Предотвращает инжект при галлюцинациях Qwen с высоким confidence.
+                # Пример: "createNewContacts" → "create","contacts" НЕ в "get contact" → блок.
+                _act_lower = act.lower()
+                _lex_matched: set[str] = set()
+                for _gn in _g_matched:
+                    _orig = ix.N.get(_gn, {}).get("name", "")
+                    if not _orig:
+                        continue
+                    _words = [w for w in toks(_orig) if len(w) >= 6]
+                    if any(w in _act_lower for w in _words):
+                        _lex_matched.add(_gn)
+                _g_matched = _lex_matched
+
+            if _g_matched:
+                # Обновить best_per_mod: если matched handler в том же модуле → заменить
+                for _gn in _g_matched:
+                    _gmod = ix.module.get(_gn, "")
+                    if _gmod in best_per_mod:
+                        best_per_mod[_gmod] = _gn  # swap: Qwen handler приоритетнее
+                hs = set(best_per_mod.values())
+
+        # Записать граф-состояние шага для следующего (zero-hardcode flow tracking)
+        if flow_ctx is not None and hs:
+            flow_ctx.record(hs, ix)
+
+        # Запомнить активные сервисы для continuity на следующих шагах
+        if oracle is not None:
+            for h in hs:
+                svc = ix.module.get(h, "")
+                if svc:
+                    oracle.mark_service_active(svc)
+            # Сформировать handler_names для Qwen-истории: "short-mod.methodName"
+            _h_names = []
+            for h in hs:
+                mod = ix.module.get(h, "")
+                name = ix.N.get(h, {}).get("name", "")
+                if mod and name:
+                    short = mod.replace("ts-", "").replace("-service", "")
+                    _h_names.append(f"{short}.{name}")
+            # Graph-guided session history: remote_call-соседи текущего шага
+            oracle.record_step(
+                step_idx, step_info.step_type, hs,
+                ix.wiring, ix.module, ix.calls,
+                handler_names=_h_names,
+            )
+
         entries |= hs
         prev_files = (
             set().union(*(files.get(h, set()) for h in hs))
@@ -570,6 +886,27 @@ def enhanced_ground(
             touched |= {ix.module[m] for m in ix.closure(hs)[0]}
 
         log.append((st.get("n"), act, step_info, [(sc, h) for sc, h in ranked[:5]], hs, effective_train_type, semantic_top3))
+
+        if viz_log is not None:
+            viz_log.append({
+                "num": st.get("n", 0),
+                "text": act,
+                "type": step_info.step_type,
+                "train": effective_train_type or "-",
+                "candidates": [
+                    {
+                        "service": ix.module.get(h, ""),
+                        "method": h.split(":", 2)[2] if h.count(":") >= 2 else h,
+                        "score": round(float(sc), 4),
+                        "selected": h in hs,
+                        "_nid": h,
+                    }
+                    for sc, h in ranked[:5]
+                ],
+                "_selected_nids": list(hs),
+                "_train_type": effective_train_type or "",
+                "trace": {},
+            })
 
     if explain:
         for n, act, si, top, hs, eff_tt, sem_top3 in log:

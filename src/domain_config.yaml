@@ -167,6 +167,16 @@ step_rules:
       - 'check what.*consign'
       - 'list of.*consign'
 
+  # Изменение данных консигнации (выше add_consign: "change" не "add")
+  # 'consignee' убран: слово встречается в booking-текстах ("to a consignee") → FP
+  - type: update_consign
+    patterns:
+      - 'change.*consign'
+      - 'update.*consign'
+      - 'modify.*consign'
+      - "change.*consignee's"
+      - "update.*consignee"
+
   # Только отдельный шаг добавления консигнации (не при бронировании)
   - type: add_consign
     patterns:
@@ -207,11 +217,21 @@ step_rules:
       - 'payment'
 
   # check_refund выше cancel: "how much refunded" — запрос суммы, не отмена
+  # 'refund' одиночный убран: слишком широко — ловил "refunded to the balance" в rebook-шагах
   - type: check_refund
     patterns:
-      - 'refund'
+      - 'ask.*refund'
+      - 'how much.*refund'
       - 'how much.*cancel'
+      - 'calculate.*refund'
       - 'calculate.*cancel'
+
+  # filter by ... status → query_orders, выше cancel ("Cancel status" без глагола cancel действия)
+  - type: query_orders
+    patterns:
+      - "filter.*status"
+      - "'cancel'\\s+status"
+      - "status.*cancel"
 
   - type: cancel
     patterns:
@@ -224,19 +244,47 @@ step_rules:
       - 'change ticket'
       - 'change the trip'
 
+  # Вход на станцию / посадка на поезд
+  - type: enter_station
+    patterns:
+      - 'enter the station'
+      - 'board the train'
+      - '^board\b'
+
   - type: collect
     patterns:
       - '^collect\b'
       - 'pick up'
       - 'take the ticket'
 
-  # search — выше view_trip чтобы "open the details ... cheapest trip" не было search_advanced
-  # add_trip выше search_train: "Add a new trip ... departing 09:00" иначе
-  # ловится search_train по слову "departing"
+  # add_trip ВЫШЕ search_transit: "Add a new trip ... via ... to ..." иначе
+  # 'via .* to' в search_transit ловит add_trip шаги (S6.6)
   - type: add_trip
     patterns:
       - '^add.*trip'
       - '^create.*trip'
+
+  # transit/transfer search: "trips with a transfer"
+  - type: search_transit
+    patterns:
+      - 'transfer at'
+      - 'with a transfer'
+      - 'via .* to'
+
+  # Страховка/ассюранс: запрос записи или списка типов
+  - type: query_insurance
+    patterns:
+      - 'assurance.*record'
+      - 'insurance.*record'
+      - 'list of assurance'
+      - 'list of insurance'
+      - 'look up.*assur'
+
+  # Цена заказа
+  - type: check_price
+    patterns:
+      - 'check.*price'
+      - 'price of the order'
 
   - type: search_advanced
     patterns:
@@ -253,6 +301,12 @@ step_rules:
       - 'trips from'
       - 'trains from'
       - 'departing'
+
+  # Admin: список всех заказов — query_orders ВЫШЕ view_trip ('open.*order' слишком широкий)
+  - type: query_orders
+    patterns:
+      - 'list of all orders'
+      - 'all orders in the system'
 
   - type: view_trip
     patterns:
@@ -306,9 +360,18 @@ step_rules:
       - 'add.*station'
       - 'new station'
 
+  # add_price ВЫШЕ add_train_type: "Add a price config for train type X" не должен матчить add_train_type
+  - type: add_price
+    patterns:
+      - 'price configuration'
+      - 'price config'
+      - 'basic rate'
+      - '^add.*price'
+
+  # add_train_type: паттерн с ^ чтобы не матчить "for train type" в середине предложения
   - type: add_train_type
     patterns:
-      - 'add.*train type'
+      - '^add.*train type'
       - 'new train type'
       - 'gaoties'
 
