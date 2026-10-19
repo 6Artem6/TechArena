@@ -163,19 +163,12 @@ def predict_scenario(
         # oracle.train_type накоплен через parse_step в enhanced_ground
         train_type = oracle.train_type
 
-        # Опциональные сервисы: исключить remote_call к сервисам которые в этом
-        # сценарии не использовались (нет food/insurance в booking шагах).
-        # Предотвращает FP remote-рёбра к ts-food-service / ts-assurance-service.
-        _FOOD_MODS = frozenset({
-            "ts-food-service", "ts-food-delivery-service",
-            "ts-train-food-service", "ts-station-food-service",
-        })
-        _INS_MODS = frozenset({"ts-assurance-service"})
+        # Preserve.preserve() всегда вызывает food и assurance по remote_call
+        # даже когда пользователь их не заказал (инициализация/проверка).
+        # Ground truth включает эти методы для всех booking сценариев.
+        # Исключение вызывало FN: archive включал food=5, assurance=7, delivery=1
+        # для сценариев с "without food/assurance".
         excluded_modules: frozenset[str] = frozenset()
-        if not oracle.has_food:
-            excluded_modules = excluded_modules | _FOOD_MODS
-        if not oracle.has_insurance:
-            excluded_modules = excluded_modules | _INS_MODS
 
         # search_transit: entry-handler-ы этих шагов вызывают ОБА сиблинг-сервиса
         # (transfer search запрашивает все типы поездов), поэтому для них
@@ -188,7 +181,7 @@ def predict_scenario(
 
         if transit_entries and train_type:
             t_methods, t_edges, t_remote, t_data = pruned_closure(
-                transit_entries, _index, "", excluded_modules)
+                transit_entries, _index, train_type, excluded_modules)
             other_entries = entries - transit_entries
             if other_entries:
                 o_methods, o_edges, o_remote, o_data = pruned_closure(
@@ -204,7 +197,7 @@ def predict_scenario(
                 entries, _index, train_type, excluded_modules)
     else:
         train_type = ""
-        entries = ground(_index, _scorer, _files, S)
+        entries = enhanced_ground(_index, _scorer, _files, S)
         methods, edges, remote, data = enhanced_closure(entries, _index)
         step_log = None
 
