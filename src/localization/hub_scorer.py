@@ -101,11 +101,10 @@ def rerank_by_hub(
     work = candidates[:top_k]
     score_map = {h: sc for sc, h in work}
 
-    # Нормировать существующие оценки
+    # Hub score: сумма нормированных оценок достижимых handlers
     max_sc = max(score_map.values()) or 1.0
     norm_map = {h: sc / max_sc for h, sc in score_map.items()}
 
-    # Hub score: сумма нормированных оценок достижимых handlers
     hub: dict[str, float] = {}
     for sc, h in work:
         reachable_in_top = reachable.get(h, frozenset()) & score_map.keys()
@@ -116,11 +115,12 @@ def rerank_by_hub(
 
     hub_max = max(hub.values()) or 1.0
 
-    # Объединить
+    # Аддитивный boost: сохраняем исходный масштаб scores (важно для tau-window).
+    # new_score = sc + gamma * (hub_norm / hub_max) * max_sc
+    # → boost пропорционален исходному best score → tau-window не ломается.
     combined: list[tuple[float, str]] = [
         (
-            (1.0 - gamma) * norm_map.get(h, 0.0)
-            + gamma * hub.get(h, 0.0) / hub_max,
+            sc + gamma * (hub.get(h, 0.0) / hub_max) * max_sc,
             h,
         )
         for sc, h in work

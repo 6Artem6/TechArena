@@ -66,6 +66,8 @@ USED_FILES: list[str] = [
     "src/localization/java_context.py",
     "src/localization/qwen_encoder.py",
     "src/localization/passport_generator.py",
+    "src/localization/service_router.py",
+    "src/localization/fsm_transitions.py",
 
     # Parsers: Java AST — только Java-парсер нужен для enrichment
     "src/parsers/__init__.py",
@@ -133,6 +135,7 @@ USED_FILES: list[str] = [
 DEV_SCRIPTS: list[str] = [
     "scripts/eval.py",
     "scripts/pack.py",
+    "scripts/submit.py",
 ]
 
 # ---------------------------------------------------------------------------
@@ -173,6 +176,7 @@ CACHE_FILES: list[str] = [
     "cache/service_passports.pkl",
     "cache/qwen_encoder_cache.pkl",
     "cache/ce_scores_cache.pkl",
+    "cache/fsm_transitions.json",
 ]
 
 

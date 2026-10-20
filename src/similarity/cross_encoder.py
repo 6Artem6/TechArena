@@ -173,3 +173,32 @@ class CrossEncoder:
         except Exception as exc:
             _log.debug("CrossEncoder.rerank() ошибка: %s — fallback", exc)
             return candidates
+
+    def score_pair(self, query: str, doc: str) -> float:
+        """Scored (query, doc) → sigmoid logit в [0, 1].
+
+        0.5 = граница: >0.5 → relevant, <0.5 → not relevant.
+        Результат кешируется по паре (query, doc).
+        """
+        if not self.enabled:
+            return 0.0
+        global _CE_CACHE_DIRTY
+        pair_key = ("pair", query, doc)
+        if pair_key in _CE_SCORES_CACHE:
+            return _CE_SCORES_CACHE[pair_key]
+        try:
+            import torch  # type: ignore  # noqa: PLC0415
+            enc = _CE_TOKENIZER(
+                [query], [doc],
+                padding=True, truncation=True, max_length=512, return_tensors="pt",
+            )
+            with torch.no_grad():
+                logit = _CE_MODEL(**enc).logits.squeeze(-1)
+            raw = logit.item() if hasattr(logit, "item") else float(logit)
+            score = 1.0 / (1.0 + math.exp(-raw))
+            _CE_SCORES_CACHE[pair_key] = score
+            _CE_CACHE_DIRTY = True
+            return score
+        except Exception as exc:
+            _log.debug("CrossEncoder.score_pair() ошибка: %s", exc)
+            return 0.0

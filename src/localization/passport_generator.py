@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,9 +22,9 @@ if TYPE_CHECKING:
     from src.core.skeleton_index import Index
     from src.localization.qwen_encoder import QwenEncoder
 
-_CACHE_FILE = Path.home() / ".cache" / "service_passports.json"
+_CACHE_FILE = Path(__file__).parents[2] / "cache" / "service_passports.pkl"
 _MAX_SRC_CHARS = 6000   # обрезать файл при превышении
-_NUM_PREDICT   = 600    # достаточно для 4-8 endpoint-ов
+_NUM_PREDICT   = 1200   # 600 обрезало JSON у контроллеров с 10+ endpoint-ами
 
 
 # ---------------------------------------------------------------------------
@@ -39,32 +40,47 @@ class PassportData(NamedTuple):
 # Промпт для Qwen
 # ---------------------------------------------------------------------------
 
-_PASSPORT_SYSTEM = (
+_LANG_BY_EXT: dict[str, str] = {
+    ".java": "Java", ".py": "Python", ".go": "Go",
+    ".ts": "TypeScript", ".js": "JavaScript", ".kt": "Kotlin",
+    ".cs": "C#", ".rb": "Ruby", ".php": "PHP",
+}
+
+_PASSPORT_SYSTEM_TMPL = (
     "You are generating semantic descriptions for REST API endpoints.\n"
-    "Given Java controller source code, for each @GetMapping/@PostMapping/"
-    "@PutMapping/@DeleteMapping method return a JSON object.\n\n"
+    "Given {lang} source code of a web controller/handler module, for each HTTP endpoint "
+    "method (typically marked with route annotations or decorators) return a JSON object.\n\n"
     "Fields per endpoint:\n"
-    "  method_name: exact Java method name\n"
+    "  method_name: exact method/function name as it appears in the source\n"
     "  business_summary: 1 sentence — what a USER does when calling this endpoint\n"
-    "  synonyms: 5-8 natural language phrases a user might say (NOT Java identifiers)\n\n"
+    "  synonyms: 5-8 natural language phrases a user might say (NOT code identifiers)\n\n"
     "CRITICAL:\n"
     "  - synonyms MUST distinguish THIS endpoint from others in the same controller\n"
     "  - search variants: list specific criteria (cheapest/quickest/transfer/fewest stops)\n"
     "  - 'transfer'/'transit'/'layover' ONLY for endpoints that handle multi-leg journeys\n"
     "  - admin actions: use admin verbs (add station, add route, configure, manage)\n\n"
     "Example output:\n"
-    '{"endpoints": [\n'
-    '  {"method_name": "getTransferResult",\n'
+    '{{"endpoints": [\n'
+    '  {{"method_name": "getTransferResult",\n'
     '   "business_summary": "Find train routes requiring a transfer at an intermediate station.",\n'
     '   "synonyms": ["transit", "transfer", "layover", "connection", "via", '
-    '"indirect route", "change trains", "intermediate stop"]},\n'
-    '  {"method_name": "getByCheapest",\n'
+    '"indirect route", "change trains", "intermediate stop"]}},\n'
+    '  {{"method_name": "getByCheapest",\n'
     '   "business_summary": "Find the cheapest direct train between two stations.",\n'
     '   "synonyms": ["cheapest", "lowest price", "budget", "least expensive", '
-    '"minimum cost", "affordable"]}\n'
-    "]}\n"
+    '"minimum cost", "affordable"]}}\n'
+    "]}}\n"
     "Output ONLY valid JSON. No other text."
 )
+
+
+def _build_passport_system(src_path: Path) -> tuple[str, str]:
+    """Вернуть (system_prompt, lang) для файла по расширению."""
+    lang = _LANG_BY_EXT.get(src_path.suffix.lower(), "")
+    lang_prefix = f"{lang} " if lang else ""
+    system = _PASSPORT_SYSTEM_TMPL.replace("Given {lang} source code", f"Given {lang_prefix}source code")
+    code_lang = lang.lower() if lang else "text"
+    return system, code_lang
 
 _PASSPORT_SCHEMA = {
     "type": "object",
@@ -100,14 +116,15 @@ def _generate_for_file(
     qwen: "QwenEncoder",
 ) -> dict[str, PassportData]:
     """Один Qwen-вызов для всего контроллера → {method_name: PassportData}."""
+    system, lang = _build_passport_system(src_path)
     src_text = src_path.read_text(errors="ignore")[:_MAX_SRC_CHARS]
-    prompt = f"Controller source:\n```java\n{src_text}\n```"
+    prompt = f"Controller source:\n```{lang.lower()}\n{src_text}\n```"
 
     try:
         raw = qwen._call_ollama(
             prompt=prompt,
             schema=_PASSPORT_SCHEMA,
-            system=_PASSPORT_SYSTEM,
+            system=system,
             num_predict=_NUM_PREDICT,
             timeout=300,
         )
@@ -166,7 +183,7 @@ def load_or_generate_passports(
     cache: dict[str, dict] = {}
     if _CACHE_FILE.exists():
         try:
-            cache = json.loads(_CACHE_FILE.read_text())
+            cache = pickle.loads(_CACHE_FILE.read_bytes())
         except Exception:
             cache = {}
 
@@ -228,7 +245,8 @@ def load_or_generate_passports(
                     print(f"[passport] worker error: {exc}", file=sys.stderr)
 
         try:
-            _CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=1))
+            _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _CACHE_FILE.write_bytes(pickle.dumps(cache))
         except Exception as exc:
             print(f"[passport] cache save error: {exc}", file=sys.stderr)
 

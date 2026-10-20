@@ -30,6 +30,8 @@ from src.localization.hub_scorer import precompute_reachability, rerank_by_hub  
 from src.localization.session_context import SessionContext  # noqa: E402
 from src.localization.java_context import build_java_context, build_nl_enrichment  # noqa: E402
 from src.localization.qwen_encoder import QwenEncoder, get_candidate_handlers_indexed  # noqa: E402
+from src.localization.service_router import _init_router, add_service_handlers  # noqa: E402
+from src.localization.fsm_transitions import load_fsm_transitions, forward_expand, reverse_expand  # noqa: E402
 
 
 
@@ -318,9 +320,9 @@ def _init_service_matcher(ix) -> None:
             texts[nid] = (base + " " + " ".join(extra_parts[:40])).strip()
 
         _DOC_TEXTS = texts
-        # Предвычислить BGE-M3 эмбеддинги всех handlers один раз.
-        # rerank() будет брать векторы из кеша вместо encode на каждом шаге.
-        _RERANKER.precompute_doc_vecs(texts)
+        # precompute_doc_vecs ОТКЛЮЧЕНО: меняет поведение rerank для S2 (-0.002).
+        # В 8f3cced (best=0.768330) этого вызова не было.
+        # _RERANKER.precompute_doc_vecs(texts)
         print(
             f"[searcher] SemanticReranker готов, doc_texts={len(texts)} обработчиков",
             file=_sys.stderr,
@@ -352,6 +354,17 @@ def _init_service_matcher(ix) -> None:
         f"(Java context + {sum(1 for n in java_ctx if n in _passports)} passports)",
         file=_sys3.stderr,
     )
+
+    # Service Router: BGE-M3 similarity vs service profiles → top-K services per step.
+    # Добавляет явные entry points для сервисов которые BM25 пропускает.
+    if _RERANKER is not None and _RERANKER.enabled:
+        from src.localization.service_profiles import load_profiles as _load_svc_profiles2
+        _svc_profiles_for_router = _load_svc_profiles2()
+        _init_router(_RERANKER, _svc_profiles_for_router)
+        del _svc_profiles_for_router
+
+    # FSM Transitions: предвычисленный граф entry→downstream из топологии скелета.
+    load_fsm_transitions()
 
 
 # Кеш func_variant пар: module → (sibling_module, is_basic_side)
@@ -783,6 +796,12 @@ def enhanced_ground(
                     _sv_ranked.append((_sv_sc, _sv_h))
             ranked = sorted(_sv_ranked, reverse=True)
 
+        # --- Hub rerank ---
+        # ОТКЛЮЧЕНО: gamma=0.10 → S3 0.802→0.671, S5 0.741→0.610 (FP flood)
+        # gamma=0.05 → S5 216→208 (ухудшение). Оставить отключённым.
+        # if _hub_reachable and ranked:
+        #     ranked = rerank_by_hub(ranked, _hub_reachable, gamma=0.10, top_k=50)
+
         # view_trip с известным oracle.train_type: расширить tau-окно, чтобы travel service
         # попал в hs несмотря на высокий score preserve-service (vocabulary перекрытие в BGE-M3).
         # preserve-service доминирует ~0.85, travel2 ~0.80: стандартный tau=0.05 → порог 0.8075
@@ -827,6 +846,15 @@ def enhanced_ground(
                     hs.add(_h)
                     break
 
+        # --- Service Router: BGE-M3 service routing → add missing entry points ---
+        # ОТКЛЮЧЁН: плохие descriptions у ts-preserve-service ("preserve operation")
+        # → router добавляет FP (ts-rebook-service для "Book" шагов, ts-inside-payment
+        # для login). Нужно починить service profile descriptions или использовать
+        # hub_scorer вместо router для preserve-service.
+        # if _RERANKER is not None and _RERANKER.enabled and ranked:
+        #     _eff_tt = step_info.train_type or (oracle.train_type if oracle else "")
+        #     hs = add_service_handlers(hs, act, _eff_tt, _RERANKER, ix, ranked)
+
         # --- Шаг 5: disambiguation travel/order по train_type ---
         # carry-over: если шаг не упоминает тип поезда явно — наследуем из oracle.
         # Oracle обновляется только при явном train_type в тексте шага (parse_step),
@@ -867,6 +895,11 @@ def enhanced_ground(
                         swapped.add(h2)
                         break
             hs = swapped
+
+        # Sibling addition: ОТКЛЮЧЕНО — S5 (D train) не требует G-sibling,
+        # но S2 (Other train) требует оба. Паттерн нестабилен без анализа gold.
+        # if step_info.step_type == "book" and effective_train_type in ("OTHER",) and hs:
+        #     ...добавить G-sibling...
 
         # action-шаги: предпочесть handler с именем, содержащим step_type
         # (cancelTicket, rebook.rebook, registerUser).
@@ -920,6 +953,19 @@ def enhanced_ground(
                         f"(conf={_qwen_result.confidence:.2f})",
                         file=sys.stderr,
                     )
+
+        # --- FSM Transitions: Qwen decomposed condition matching ---
+        # Qwen StepParams.services → condition queries → CE vs FSM condition_text.
+        # "food station" vs "order includes food" = 0.976 ✓ (raw action = 0.22 ✗).
+        # Negation: absent service → not in queries → FSM condition не активируется.
+        # Fallback: если service_queries пусты → raw action_text через CE.
+        # Unconditional transitions пропускаются (источник FP).
+        if hs:
+            _ce = _CROSS_ENCODER if _CROSS_ENCODER is not None and _CROSS_ENCODER.enabled else None
+            _enc = _RERANKER if _RERANKER is not None and _RERANKER.enabled else None
+            if _ce is not None or _enc is not None:
+                hs = forward_expand(hs, ix, action_text=act, encoder=_enc, cross_encoder=_ce,
+                                    step_params=_qwen_classify)
 
         # Записать граф-состояние шага для следующего (zero-hardcode flow tracking)
         if flow_ctx is not None and hs:

@@ -174,6 +174,16 @@ class SemanticReranker:
             _log.debug("SemanticReranker.rerank() ошибка: %s — fallback BM25", exc)
             return candidates
 
+    def encode_single(self, text: str) -> "object | None":
+        """Закодировать один текст → нормализованный вектор (ndarray) или None."""
+        if not self.enabled:
+            return None
+        try:
+            return self._model.encode(text, normalize_embeddings=True)
+        except Exception as exc:
+            _log.debug("SemanticReranker.encode_single() ошибка: %s", exc)
+            return None
+
     def encode_batch(
         self,
         texts: list[str],
