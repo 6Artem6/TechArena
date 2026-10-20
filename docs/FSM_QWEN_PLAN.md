@@ -257,6 +257,56 @@ def route_step_to_services(action: str, step_type: str, profiles: dict,
 
 ---
 
+## Оценка предложенных контрмер (2026-10-20)
+
+### КМ-1: Inject oracle.train_type в Qwen промпт для sibling disambiguation
+
+**Решение**: Отклонить.
+
+`oracle.train_type` уже известен детерминированно в момент routing — force-swap его и использует.
+Давать Qwen правило "G→preserve, D→preserve-other" и одновременно держать force-swap означает
+две конкурирующих логики с неопределённым приоритетом.
+
+Реальная причина отказа force-swap: preserve вообще не попадает в tau-window (hub_scorer disconnected).
+Правильное решение — Phase 0 (подключить hub_scorer), а не инструктировать Qwen.
+
+Qwen должна возвращать generic "preserve" → force-swap детерминированно выбирает G/D сторону.
+
+### КМ-2: Промпт "ONLY ENTRY service" + max_items=2
+
+**Решение**: Принять с уточнением — cap поднять до 3.
+
+Промпт-инструкция корректна и необходима. Лимит 2 слишком мал: шаг search_transit вызывает
+два разных entry сервиса (travel-service + transfer-service) легитимно. Cap = 3.
+
+Дополнительно: `max_items` значим только при structured output (JSON schema от Qwen).
+При text parsing это пожелание, не ограничение — парсер должен принудительно брать
+не более N первых распознанных имён.
+
+### КМ-3: Gamma=0.15-0.20, boost только pre-filtered кандидатов
+
+**Решение**: Подтвердить — уже заложено в дизайне.
+
+`rerank_by_hub(top_k=50)` работает только на top-50 BM25 кандидатах, не на всём индексе.
+gamma=0.20 уже в плане. Новой митигации не требуется — это подтверждение текущего дизайна.
+
+### КМ-4: Параметрическое замыкание с has_food/has_assurance фильтрацией
+
+**Решение**: Принять с уточнением механизма.
+
+Проблема реальная: closure table офлайн включит food/assurance ветки для всех scenarios,
+тогда как predict.py использует `excluded_modules` для исключения этих сервисов.
+
+Более простое решение чем "параметрическое замыкание":
+- Pre-compute **полную** closure без exclusions (офлайн, O(1) lookup)
+- При запросе: `methods = closure_table[(nid, train_type)]["methods"] - excluded_nids`
+- `excluded_nids` = union всех nids из excluded_modules сервисов (уже вычислен в predict.py)
+- Результат: O(1) lookup + O(k) set difference, корректно без пересчёта BFS
+
+Добавить в Phase 1: при загрузке closure table построить `excluded_nids_by_service` индекс.
+
+---
+
 ## Что НЕ входит в этот план
 
 - Изменение логики BFS/pruned_closure (не трогать — transit "" доказано важен)
