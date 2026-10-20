@@ -274,7 +274,15 @@ def _init_service_matcher(ix) -> None:
                     extra_parts.append(nl_tok)
                     seen.add(nl_tok)
 
-            # Passport synonyms отключены (H1: passport noise hurts CE/BGE-M3 ranking)
+            # Passport synonyms: Qwen-генерированные бизнес-термины из кода контроллера.
+            # Не фильтруются через _is_informative — они уже специфичны для данного endpoint.
+            _p = _passports.get(nid)
+            if _p:
+                for _syn in _p.synonyms[:8]:
+                    for _tok in toks(_syn):
+                        if len(_tok) > 2 and _tok not in seen:
+                            extra_parts.append(_tok)
+                            seen.add(_tok)
 
             texts[nid] = (base + " " + " ".join(extra_parts[:40])).strip()
 
@@ -299,6 +307,10 @@ def _init_service_matcher(ix) -> None:
     _CE_DOC_TEXTS = {}
     for nid in set(list(base_texts) + list(java_ctx)):
         parts = [base_texts.get(nid, ""), java_ctx.get(nid, "")]
+        _p = _passports.get(nid)
+        if _p:
+            parts.append(_p.business_summary)
+            parts.append(" ".join(_p.synonyms))
         _CE_DOC_TEXTS[nid] = " ".join(p for p in parts if p).strip()
     import sys as _sys3
     print(
