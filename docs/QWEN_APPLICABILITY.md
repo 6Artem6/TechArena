@@ -1,8 +1,8 @@
 # Применимость Qwen и LLM-препроцессинга в пайплайне
 
-**Дата:** 2026-10-18  
+**Дата:** 2026-10-18 (обновлено)  
 **Контекст:** TechArena — Execution Trace Prediction, Train Ticket microservices  
-**Текущий score:** 0.7254 (S1=0.807, S2=0.712, S3=0.802, S4=0.808, S5=0.594, S6=0.721, S7=0.634)
+**Score на момент написания:** 0.7319 → **актуальный best: 0.7683** (S1=0.807, S2=0.737, S3=0.802, S4=0.808, S5=0.741, S6=0.801, S7=0.683). Актуальный статус — в IMPROVEMENTS.md.
 
 ---
 
@@ -42,22 +42,12 @@ Sibling-фильтрация оставлена на месте. S5=0.594 — и
 
 ---
 
-### 3. Предвычисленные эмбеддинги описаний сервисов → LanceDB
-**Приоритет:** Высокий — оценка +0.02–0.05 IoU  
-**Суть:**
-1. Офлайн-скрипт: для каждого сервиса собрать имена методов, комментарии, типы из `index.json`
-2. Qwen генерирует короткое описание сервиса (1–3 предложения)
-3. BGE-M3 кодирует описание → вектор
-4. Вектора хранятся в LanceDB
-5. При поиске: запрос пользователя → BGE-M3 → ANN-поиск по LanceDB → топ-k сервисов-кандидатов
+### 3. Паспорта handler-ов (→ SP.1/SP.2/SP.3) ✅
+**Статус:** ✅ Реализовано. Сделано иначе, чем планировалось: не LanceDB, а `cache/service_passports.pkl` (240 паспортов). Каждый паспорт: `business_summary` + `synonyms[]`. Синонимы добавлены в doc_texts для CE и BGE-M3.
 
-**Почему поможет:** сейчас поиск handler-ов идёт по BM25+BGE на именах методов. Семантические описания сервисов позволят находить кандидатов по смыслу запроса, а не по лексическому совпадению. Направление эффекта — уменьшение FN на remote-рёбрах; величина зависит от текущего состава ошибок по сценариям (неизвестна без полного GT).
+**Что работает:** getTransferResult теперь отличим от getByCheapest в ts-travel-plan-service. S5: 0.640 → 0.741 → 0.801.
 
-**Пример:** для `search transfer` текущий BM25 ищет слово "transfer" в именах методов. С описаниями сервисов найдётся `ts-travel-service: "handles high-speed train travel queries and trip search"` → правильный кандидат для S5.
-
-**Файлы к изменению:**
-- Новый скрипт `scripts/build_service_index.py`
-- `src/localization/searcher.py` — добавить фазу ANN-кандидатов перед BM25
+**Что НЕ реализовано из оригинального плана:** ANN-поиск через LanceDB (нет необходимости при 240 handlers — BM25+BGE справляются).
 
 ---
 
@@ -108,17 +98,26 @@ Sibling-фильтрация оставлена на месте. S5=0.594 — и
 
 ---
 
-## Приоритетный роадмап
+## Приоритетный роадмап (обновлено 2026-10-19)
 
-| Приоритет | Идея | Направление эффекта | Сложность |
-|-----------|------|---------------------|-----------|
-| 1 | Предвычисленные эмбеддинги сервисов → LanceDB | ↑ recall на remote-рёбрах (меньше FN) | Высокая |
-| 2 | Локальное хранение BGE-M3 | стабильность запуска, без IoU-эффекта | Низкая |
-| 3 | Семантический фильтр в Qwen-инжекции | ↑ precision (меньше шумных терминов) | Средняя |
-| 4 | Обогащение запроса через data-flow граф | ↑ recall (меньше FN в handler-ах) | Средняя |
-| 5 | Синонимы из описаний сервисов | ↑ recall, риск ↓ precision | Средняя |
-| 6 | LanceDB кластеризация ключевых слов | неизвестно | Высокая |
-| 7 | Qwen правила из AST | риск нарушения Manifesto | Очень высокая |
+**Текущий best: 0.768330** (S1=0.807, S2=0.737, S3=0.802, S4=0.808, S5=0.741, S6=0.801, S7=0.683).  
+**Последний сабмит (регрессия): 0.755640** — изменения сессии 2026-10-19 дали −0.01269.
+
+| Приоритет | Идея | Статус | Направление эффекта | Сложность |
+|-----------|------|--------|---------------------|-----------|
+| 1 | Паспорта handler-ов offline (SP.1/SP.2/SP.3) | ✅ Реализовано (pkl, 240 passports) | ↑ S5: 0.640→0.741→0.801 | — |
+| 2 | StepParams contract P1.3 (services/payment/keywords) | ✅ Реализовано (консервативная версия) | ↑ S2: +0.014 | — |
+| 3 | Персистентный Qwen-кеш | ✅ Реализовано | ↓ runtime | — |
+| 4 | Локальное хранение BGE-M3 | ✅ Уже готово | стабильность запуска | — |
+| **5** | **Расследование регрессии train_type PRIMARY** | **КРИТИЧНО** | **восстановление 0.768330** | **Низкая (~5 строк)** |
+| **6** | **hub_scorer: добавить rerank_by_hub вызов** | **Не подключено** | **↑ ~0.005–0.01 avg** | **Низкая (~5 строк)** |
+| **7** | **StepParams: search_criteria → extra_tokens** | **Не подключено** | **↑ ~0.005 S5** | **Низкая (~8 строк)** |
+| **8** | **Bugfix get_service("luggage") startswith** | **Баг** | **↑ ~0.002 luggage steps** | **1 строка** |
+| 9 | order_filter + actor_role подключение | Не подключено | ↑ ~0.003–0.005 | Низкая (~10 строк) |
+| 10 | IDF-weighted BM25 func_variant disambiguation | ✅ Реализовано (сессия 2026-10-19) | S5 exec 208→214 ✓ | — |
+| 11 | Semantic filter для Qwen keywords (вместо _SAFE_KEYWORD_TYPES) | Не реализовано | ↑ injection quality | Средняя |
+| 12 | P-54 CFG branch pruning (tree-sitter if_statement → cfg_condition) | Не реализовано | ↑ ~0.02–0.05 (CRITICAL P-54) | Высокая (~70 строк) |
+| 13 | SV.1 Bottom-up service validation (γ=0.10–0.20) | ✅→ОТКАТАНО | регрессия при текущих γ | — |
 
 > **Примечание о количественных оценках:** IoU = |A∩B|/|A∪B| нелинейна.
 > Реальный прирост зависит от текущих |TP|, |FP|, |FN| по каждому типу рёбер
@@ -126,6 +125,65 @@ Sibling-фильтрация оставлена на месте. S5=0.594 — и
 > Числовой эффект можно оценить только после реализации через eval на S0 и сабмит.
 
 ---
+
+## Изменения сессии 2026-10-18 (часть 2)
+
+### Index-based Qwen selection (реализовано)
+`qwen_encoder.py`: вместо генерации имён handler-ов Qwen получает пронумерованный список кандидатов и возвращает `{index, confidence}`.
+
+**Исправленные проблемы:**
+- Баг `_init_backend`: `qwen2.5-coder:3b` не существует в ollama — все вызовы молча падали с HTTP 404. Исправлена логика определения модели: теперь точное совпадение, fallback по семейству (7b→1.5b по убыванию).
+- `_NUM_PREDICT`: снижен с 160 до 40 токенов (индекс = 1-3 цифры).
+- Lexical filter добавлен обратно: хотя бы одно слово ≥6 букв из имени handler-а должно присутствовать в action-тексте. Предотвращает галлюцинации (`home (conf=1.00)`, `createDefaultUser (conf=0.90)`).
+- Attribution logging: `[qwen] module prev_handler → new_handler (conf=X.XX)` в stderr.
+- Персистентный кеш: `~/.cache/qwen_encoder_cache.pkl`. Ускоряет повторные запуски (все запросы тех же шагов = 0 вызовов ollama).
+
+**Текущий результат:** Qwen работает (7b), но lexical filter блокирует все инжекции текущих сценариев S0-S7. Qwen не улучшает и не ухудшает score. Кеш строится на первом прогоне.
+
+### Предложенные направления (2026-10-18 session 2)
+
+Пользователь предложил 3-фазную архитектуру интеграции Qwen:
+
+**Фаза 1 (Offline LanceDB)** — наивысший приоритет:
+- Qwen генерирует "бизнес-паспорта" для каждого Java-метода (1-2 предложения)
+- BGE-M3 кодирует → LanceDB хранит
+- Runtime ANN-поиск по action → топ-8 сервисов-кандидатов
+- Эффект: устраняет разрыв словаря (consignment↔consign, board↔execute)
+
+**Распараллеливание Qwen:**
+- ollama + `OLLAMA_NUM_PARALLEL=4` на GPU
+- Python ThreadPoolExecutor для параллельных HTTP-запросов
+- Ограничение: oracle.step_history строится последовательно — нужен 2-проходный предиктор
+
+**Персистентный кеш** — реализовано. Кеш по `(action, history, handlers)` → `{index, confidence}`.
+
+---
+
+## Изменения сессии 2026-10-18
+
+### S5 split-closure (реализовано)
+`predict.py`: при наличии `search_transit` шагов в сценарии entry-handler-ы этих шагов запускаются в отдельном `pruned_closure` без `train_type`-фильтра. Остальные entries используют штатный фильтр.
+
+**Результат:** ts-travel-service теперь появляется в S5 remote (ранее 0 рёбер). Другие сценарии (S1-S4, S6-S7) не затронуты — у них нет `search_transit` шагов.
+
+**Проверено на S0:** 0.980 → без регрессии.
+
+### Extra_tokens для консигнации и check_refund (реализовано, без подтверждённого эффекта)
+`step_typer.py`:
+- `update_consign`, `add_consign`: добавлен "consign"×2 — мост между "consignment" в тексте и "consign" в именах handler-ов
+- `check_refund`: добавлен "calculate", "refund" — усиление ts-cancel-service/calculate
+- `query_consign`: НЕ изменяли — добавление "consign" ломает S0 (query_consign есть в S0)
+
+**Проверено:** S7 предсказания идентичны до/после → BGE-M3 уже справляется с семантикой.
+
+### BGE-M3 локальный кеш (уже готово)
+Модели `BAAI/bge-m3` и `BAAI/bge-reranker-base` уже в `~/.cache/huggingface/hub/`. Дополнительных действий не требуется.
+
+### Диагностика S7=0.634
+- S7 имеет 49 remote edges (vs baseline 5) — значительно больше ожидаемого GT
+- Основные источники over-prediction: ts-order-service:17 (из множества сервисов имеющих remote_call к нему), ts-food-service:1 (FP — S7 без food step)
+- Root cause: BFS следует всем статическим remote_call рёбрам скелета, включая опциональные пути (food при бронировании)
+- Без GT для S7 точечное исправление невозможно без риска регрессий
 
 ## Нерешённые проблемы
 
@@ -139,6 +197,71 @@ Sibling-фильтрация оставлена на месте. S5=0.594 — и
 ### S7=0.634 — Неизвестный сценарий
 **Причина:** не диагностирована — GT для S7 недоступен локально.  
 **Гипотеза:** проблема с локализацией handler-ов или неверный train_type.
+
+---
+
+## Изменения сессии 2026-10-18 (часть 3 — StepParams, P-54)
+
+### StepParams — три неиспользованных поля из PROBLEMS.md
+
+Qwen уже извлекает 9 полей и кеширует. Три поля ни разу не были использованы в pipeline:
+
+| Поле | Что Qwen извлекает (из кеша 69 cls_v2 записей) | Применение |
+|---|---|---|
+| `search_criteria` | `"quickest"`, `"fewest_stops"`, `"cheapest"`, `"transfer"` | BM25 extra_tokens для search_advanced — различают getByQuickest/getByCheapest/getByMinStation |
+| `order_filter` | `"status:Paid"`, `"status:New"`, `"date:purchase"` | "paid" BM25 token для query_orders |
+| `actor_role` | `"admin"`, `"passenger"` | is_admin hint в searcher.py → потенциально S7 |
+
+**Баг:** `get_service("luggage")` — строгое равенство, Qwen возвращает `"luggage/consign"`. Luggage через Qwen не работает. Fix: `svc.name.startswith(name)`.
+
+### P-54 из PROBLEMS.md — главный нереализованный Qwen use case
+
+PROBLEMS.md помечает P-54 как CRITICAL: branch selection — главный bottleneck. `if (tripId.startsWith("G"))` → оба пути в BFS → FP remote/calls рёбра.
+
+**Qwen offline применение:** анализировать Java if-statements в исходниках → извлекать условия вида `startsWith("G"/"D")` → сохранять как `cfg_condition` атрибут на remote_call рёбра → использовать в `pruned_closure` для фильтрации.
+
+```python
+# Пример: ts-preserve-service/preserveService.java
+# if (tripId.startsWith("G") || tripId.startsWith("D")) → travel-service URL
+# else → travel2-service URL
+# cfg_condition = {"G": ts-travel-service, "OTHER": ts-travel2-service}
+```
+
+Инфраструктура уже есть: `src/parsers/java.py` запускает tree-sitter на 401 Java-файле. Нужно добавить traversal `if_statement` узлов → ~70 строк. Ожидаемый impact по P-54: даже с правильными entry points, без CFG IoU = 0.52–0.76.
+
+**Почему Qwen здесь:** хотя это AST-задача, Qwen может дополнить tree-sitter для сложных условий (вложенные if, переменные-псевдонимы через alias analysis). Сначала реализовать через tree-sitter (P-54 §Шаг 1–3), Qwen как fallback для edge cases.
+
+---
+
+---
+
+## Изменения сессии 2026-10-19
+
+### IDF-weighted BM25 для func_variant disambiguation (новое)
+
+**Проблема (было):** `_disambiguate_func_variant` использовал tag-overlap для решения ts-travel-service vs ts-travel-plan-service. Теги ts-travel-plan-service слишком общие (`travel-planning`, `train-routes`) → "search_transit" шаги шли в basic вместо plan.
+
+**Решение (текущее):** IDF-weighted BM25 по `(vector_search_phrases + bm25_keywords)` всех профилей.
+- IDF вычисляется один раз по корпусу 42 сервисов: `log((N - df + 0.5) / (df + 0.5) + 1)`
+- Редкие термины с высоким IDF: "cheapest" (df=2, IDF=2.845), "transfer" (df=1, IDF=3.356), "fewest" (df=2, IDF=2.845)
+- Правило: `want_plan` только когда `p_score > 0 AND p_score >= b_score`
+- **Результат:** S5 exec восстановлен 208→214, calls 289→299 ✓
+
+**Статус Qwen 1.5b тегов:** `_TAG_PLAN_TMPL` добавлен для plan-сервисов, но:
+- ts-route-plan tags: `['transit', 'transfer', 'connecting', 'multi-leg', 'advanced', 'cheapest']` ✓ (хорошие)
+- ts-travel-plan tags: `['train', 'route', 'station', 'journey', 'travel', 'plan']` ✗ (слишком общие)
+- Qwen 1.5b игнорирует примеры в промпте и возвращает технические термины вместо user vocabulary
+- **Теги не используются в текущем IDF-подходе** — заменены vector_search_phrases + bm25_keywords
+
+### Qwen PRIMARY для train_type (изменение P1.3 conservative)
+
+**Было (P1.3 conservative):** step_type и train_type — ВСЕГДА из regex; Qwen только для services/payment/keywords.
+
+**Стало:** Qwen PRIMARY для train_type (`if step_params.train_type in ("G", "OTHER")`), regex как fallback.
+
+**Риск:** Qwen кеш мог зафиксировать значения из предыдущих контекстов или использовать иной формат. Для шагов "Book ticket", "Pay for ticket" — Qwen может вернуть `train_type="G"` неявно, тогда как regex возвращал "" (без изменения oracle state).
+
+**Подозрение:** именно это является главной причиной регрессии S4 0.808→0.776.
 
 ---
 

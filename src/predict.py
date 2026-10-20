@@ -174,8 +174,11 @@ def predict_scenario(
         excluded_modules: frozenset[str] = frozenset()
         if not oracle.has_food:
             excluded_modules = excluded_modules | _FOOD_MODS
-        if not oracle.has_insurance:
-            excluded_modules = excluded_modules | _INS_MODS
+        # Assurance не исключается: входит только через BFS из preserve-chain (только
+        # в booking-сценариях). S0/search-only сценарии не имеют preserve entry → assurance
+        # не достижима независимо от флага. Исключение ломало S2/S5/S6/S7 (archive ожидает).
+        # if not oracle.has_insurance:
+        #     excluded_modules = excluded_modules | _INS_MODS
 
         # search_transit: entry-handler-ы этих шагов вызывают ОБА сиблинг-сервиса
         # (transfer search запрашивает все типы поездов), поэтому для них

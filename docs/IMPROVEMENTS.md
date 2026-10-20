@@ -1,7 +1,12 @@
 # Предложения по улучшению — чего не хватает
 
-> Контекст: S0 gold = **0.852**. Текущий платформенный результат: **0.7560** (S1=0.807, S2=0.737, S3=0.802, S4=0.808, S5=0.681, S6=0.775, S7=0.683).  
-> Слабые сценарии: S5 (top-1-per-module убирает getTransferResult), S7 (admin+passenger dual-role).
+> Контекст: S0 gold = **0.852**. Текущий платформенный результат: **0.7683** (S1=0.807, S2=0.737, S3=0.802, S4=0.808, S5=0.741, S6=0.801, S7=0.683). Лучший результат — P1.3 консервативная + SP.1/SP.2/SP.3.  
+> Слабые сценарии: S2=0.737 (train_type D), S7=0.683 (admin+passenger dual-role).
+>
+> **Локальный прогресс vs nlp.json (2026-10-19):** avg 0.567 → **0.612** (+0.045) после исправлений:
+> - `ts-verification-code-service` убран из `tier4_executes_tokens` в `domain_config.yaml` → разблокирован в BFS (5 TP × 8 сценариев)
+> - Spring Security DI-contracts (`loadUserByUsername`, `getAuthorities`, `isEnabled` и др.) добавлены в `_SKIP` → убраны 6-7 FP × 8 сценариев
+> - `_detect_security_filters` (JWT FilterChain) убран → ещё -1 FP × 8
 
 ---
 
@@ -364,11 +369,15 @@ if _qwen_classify and _qwen_classify.search_keywords:
 
 **Ожидаемый эффект:** +0.005 S5. Риск: низкий. Необходим перед P1.3.
 
-### 8.3 Enable step_type override из Pass 1 (P1.3)
+### 8.3 StepParams contract — консервативная реализация (P1.3) ✅
 
-После P1.1 + P1.2: убрать `_STEP_RULES` из `step_typer.py`, использовать `_qwen_classify.step_type` как step_type. Делает pipeline переносимым — Qwen классифицирует из кода, не хардкод.
+**Реализовано (сессия 2026-10-18).** `QwenClassifyOutput` заменён на `StepParams` (9 полей: step_type, train_type, seat_class, services[], payment_mode, search_criteria[], order_filter, actor_role, keywords[]). Кеш-ключ `("cls_v2", action)`.
 
-**Ожидаемый эффект:** +0.01–0.02 avg. Риск: средний (нужна проверка всех 7 сценариев).
+**Консервативный подход** (НЕ как планировалось изначально): step_type и train_type — всегда из regex; Qwen используется только для `services`, `payment_mode`, `keywords`. Причина: Qwen возвращает `train_type="OTHER"` для D-type DongChe, тогда как pipeline намеренно маппит D-train → G-side для disambiguation. Попытка использовать Qwen train_type дала S0 -0.100, S2 -0.187.
+
+**Результат:** S2 0.723→0.737 (+0.014 из services food/insurance), avg 0.756→0.768.
+
+**Три поля извлекаются, но ещё не используются в pipeline:** `search_criteria`, `order_filter`, `actor_role` → см. §13.
 
 ---
 
@@ -446,10 +455,160 @@ Stage 1: `CE(query, service_profile)` → top-K сервисов. Stage 2: `CE(q
 
 ---
 
-## Текущий приоритет реализации (2026-10-18)
+## 12. Bottom-Up Service Validation (новое, сессия 2026-10-18)
+
+**Статус:** ✅ Реализовано → **ОТКАТАНО** (сессия 2026-10-18). Регрессия S3: service passport validation давал FP для ряда сценариев. Вернули к плоскому поиску. Идея остаётся перспективной при лучшей калибровке γ.
+
+**Идея:** использовать паспорт сервиса не как фильтр (top-down routing), а как **постфактум-валидатор** после flat поиска. Flat поиск находит handler — сервисный паспорт подтверждает или снижает его score.
 
 ```
-P1.1 (keywords non-search)  →  P1.2 (view_trip fix)  →  SP.1 (passports)
-    →  SP.2/CE.1 (enrich CE)  →  SP.3 (enrich BGE-M3)
-    →  P1.3 (step_type override)  →  ST.1 (удалить _STEP_RULES)
+query → flat search (BM25+BGE-M3+CE) → top-K handlers
+                                              ↓
+         final_score[h] += γ · service_passport_score(query, service_of(h))
+                                              ↓
+                              rerank → top-1 per module → final
+```
+
+**Отличие от Top-Down:** нет каскадных ошибок. Handler уже найден; сервисный скор только дополняет, не отсекает.
+
+**Отличие от текущего SP.1:** SP.1 добавляет synonyms в doc_texts (влияет на BGE-M3/CE косвенно через embeddings). SV.1 вычисляет явный скор сервиса поверх CE-скора handler-а.
+
+**Как агрегировать service document:**
+```python
+service_doc[service] = " ".join(
+    p.business_summary + " " + " ".join(p.synonyms)
+    for nid, p in passports.items()
+    if handler_to_service[nid] == service
+)
+```
+
+**Где помогает:**
+- "Book assurance" → handler из ts-assurance-service vs ts-inside-payment → сервисный паспорт страхования выигрывает (S2)
+- "Add food to order" → ts-food-service vs ts-food-delivery vs ts-order → паспорт пищи отличает от заказа
+
+**Где НЕ помогает:**
+- getTransferResult vs getByCheapest — оба в одном сервисе (ts-travel-plan-service), service_score одинаков → здесь работают только handler-level synonyms из SP.1
+
+**Реализация:** ~30 строк в `searcher.py` после CE reranking.  
+**Параметр:** γ ≈ 0.10–0.20, подобрать на S0.  
+**Приоритет:** НИЗКИЙ (регрессия после реализации — пока отложено).
+
+---
+
+## 13. StepParams — неиспользованные поля и баги (P1.3 conservative, сессия 2026-10-18)
+
+### Баг: get_service("luggage") молча не работает
+
+Qwen возвращает service name `"luggage/consign"`, но `get_service("luggage")` ищет строгое равенство. Luggage detection через Qwen не работает для всех шагов. Исправление в `qwen_encoder.py`:
+```python
+def get_service(self, name: str) -> "bool | None":
+    for svc in self.services:
+        if svc.name == name or svc.name.startswith(name):   # +startswith
+            return svc.present
+    return None
+```
+**Риск:** нулевой (расширяет matching, не ломает ничего).
+
+### Три неиспользованных поля
+
+| Поле | Примеры из кеша (69 cls_v2 записей) | Применение | Файл | ~строк |
+|---|---|---|---|---|
+| `search_criteria` | `["quickest"]`, `["fewest_stops"]`, `["cheapest"]`, `["transfer"]` | extra_tokens для search_advanced → различают getByQuickest/getByCheapest/getByMinStation внутри ts-travel-plan-service | `step_typer.py:_build_extra_tokens` | 8 |
+| `order_filter` | `"status:Paid"`, `"status:New"`, `"date:purchase"` | BM25 "paid" token для query_orders steps | `step_typer.py:_build_extra_tokens` | 3 |
+| `actor_role` | `"admin"`, `"passenger"` | дополнительный is_admin сигнал в searcher.py | `searcher.py:enhanced_ground` | 5 |
+
+Все поля не требуют новых Qwen-вызовов — данные уже в кеше. Суммарно ~20 строк.
+
+### Связь с PROBLEMS.md
+
+**P-54 (CRITICAL):** CFG branch pruning — главный нереализованный bottleneck. `if (tripId.startsWith("G"))` → оба пути попадают в BFS, FP remote/calls рёбра для неверного train_type. Qwen offline-анализ Java if-statements → атрибут `cfg_condition` на рёбра → использовать в `pruned_closure`. Оценка: +0.02–0.05 IoU. Инфраструктура (tree-sitter) уже есть. (~70 строк).
+
+**P-108 (MEDIUM):** `@ElementCollection` data рёбра (user_roles, route_stations) — проверить skeleton на наличие `data_resource:{table}_{field}` узлов перед реализацией. Может быть бесплатно через существующий BFS.
+
+---
+
+## Текущий приоритет реализации (2026-10-18, после P1.3 conservative)
+
+```
+✅ P1.1 → ✅ P1.2 → ✅ P1.3 (консервативная) → ✅ SP.1/SP.2/SP.3 → ✅→ОТКАТ SV.1
+
+СЛЕДУЮЩИЙ (быстро, ~20 строк):
+  bugfix get_service("luggage")
+  → search_criteria extra_tokens (search_advanced disambiguation)
+  → order_filter BM25 token (query_orders)
+  → actor_role → is_admin hint (S7)
+
+СРЕДНИЙ (~10 строк):
+  → query_decomp интеграция (тестировать регрессии на S0)
+  → query_orders в _STEP_TYPES_USE_CONTEXT
+
+ВЫСОКИЙ IMPACT (~70 строк):
+  → P-54 CFG branch pruning (tree-sitter if_statement → cfg_condition атрибут → pruned_closure)
+```
+
+---
+
+## 14. Сессия 2026-10-19 — IDF disambiguation, oracle zero-regex, регрессия
+
+**Результат:** best: **0.768330** → submitted: **0.755640** (регрессия −0.01269).  
+**Лучший результат всё ещё**: S1=0.807, S2=0.737, S3=0.802, S4=0.808, S5=0.741, S6=0.801, S7=0.683, avg=0.768330.
+
+### 14.1 Изменения в сессии
+
+| Файл | Что изменено | Статус |
+|---|---|---|
+| `src/trace/oracle.py` | Убраны все regex; oracle.parse_step() принимает StepInfo, train_type через маппинг G→G/OTHER→D | ✅ (риск регрессии для шагов где Qwen кеш отличается от regex) |
+| `src/localization/step_typer.py` | **Qwen PRIMARY** для train_type (было: regex primary, P1.3 conservative); `_G_TRAIN` Python-дефолт очищен от gaotie/dongche — но domain_config.yaml их сохраняет | ✅ YAML всё ещё правильный |
+| `src/localization/searcher.py` | `_disambiguate_func_variant`: tag-overlap → **IDF-weighted BM25** по (vector_search_phrases + bm25_keywords) | ✅ S5 локально восстановлен (208/289→214/299) |
+| `src/localization/service_profiles.py` | Добавлен `compute_profile_idf()` с module-level кешем | ✅ |
+| `scripts/gen_service_profiles.py` | `_TAG_PLAN_TMPL` для plan-сервисов (user vocabulary prompt) | ✅ (теги ts-route-plan хорошие; ts-travel-plan слишком общие) |
+
+### 14.2 Что работает и подключено
+
+- **BM25 + BGE-M3 + CE pipeline** — основа поиска handler-ов
+- **Service passports** (240 паспортов) в doc_texts для CE и BGE-M3 → S5 disambiguation ✓
+- **IDF-weighted BM25** для func_variant (plan vs basic): `searcher.py:550` → `service_profiles.compute_profile_idf()` ✓
+- **StepParams Qwen** путь: step_type, train_type (PRIMARY), food/insurance/luggage ✓
+- **step_rules** из domain_config.yaml — полный список (fallback когда Qwen = "other") ✓
+- **step_train_patterns.G** в domain_config.yaml содержит gaotie/dongche/crh/bullet → step_typer читает именно их ✓
+
+### 14.3 Реализовано, НЕ подключено к пайплайну
+
+| Компонент | Где реализован | Что отсутствует | Оценка эффекта |
+|---|---|---|---|
+| **hub_scorer** | `hub_scorer.py` + вызов `precompute_reachability(ix)` на строке 663 `searcher.py` | `rerank_by_hub` **никогда не вызывается** — импортирован но не используется | ~+0.005–0.01 avg |
+| **search_criteria** из StepParams | Qwen кеш, `qwen_encoder.StepParams.search_criteria` | `_build_extra_tokens` в step_typer.py не добавляет search_criteria → extra_tokens для search_advanced шагов | ~+0.005 S5 |
+| **order_filter** из StepParams | Qwen кеш | Не добавляется как BM25 токен для query_orders | ~+0.002 |
+| **actor_role** из StepParams | Qwen кеш | Не используется как is_admin hint | ~+0.003 S7 |
+| **query_decomp.py** | `src/localization/query_decomp.py` | Не интегрирован в `enhanced_ground()` | ~+0.005 |
+| **oracle_train_patterns** | `domain_config.yaml` | oracle.py удалён весь regex → эти паттерны мёртвые (dead config) | 0 |
+
+### 14.4 Анализ регрессии 0.768330 → 0.755640
+
+**Главная гипотеза:** P1.3 conservative устанавливал train_type из regex (стабильно детерминированный). После изменения в этой сессии Qwen стал PRIMARY. Если Qwen кеш имеет значения из других сценариев или иной формат (`"G"` vs `"g"`) — результат будет другим.
+
+**Вторичная гипотеза:** `_prefer_step_type_handler` изменён с dict-based на алгоритмический verb-подход. Rarity guard (>20% топ-50) может пропускать step_types где глагол часто встречается в handler names → другие handler-ы выигрывают top-1.
+
+**НАЙДЕНА ГЛАВНАЯ ПРИЧИНА РЕГРЕССИИ:** SV.1 Bottom-up service validation (`_SV_DISTINCTIVE_TOKS` boost, γ=0.12) активен в текущем `searcher.py` (строки 815–827), хотя IMPROVEMENTS.md помечает его как "ОТКАТАНО". В коммите 08d0895 этого кода НЕТ СОВСЕМ — он был добавлен в этой сессии. Boost до 12% для handlers из сервисов с "distinctive" токенами нарушает ранжирование для всех сценариев.
+
+**Стратегия восстановления (в порядке приоритета):**
+1. **ГЛАВНОЕ**: Убрать SV.1 boost блок `searcher.py:815–827` (строки `if _SV_DISTINCTIVE_TOKS and ranked: ... ranked = sorted(_sv_ranked, reverse=True)`) — это должно восстановить 0.768330
+2. Проверить что passpport synonyms сокращение `[:8]→[:4]` (строка ~312) не вызывает регрессию — рассмотреть возврат к `[:8]`
+3. Qwen PRIMARY для train_type — НЕ является причиной: кеш не имеет cls_v3 записей, `batch_classify_steps` всегда возвращает пустые StepParams → classify() всегда через regex fallback
+
+### 14.5 Следующие приоритеты
+
+```
+КРИТИЧНО — разобраться с регрессией:
+  → git diff 08d0895..HEAD src/localization/step_typer.py → понять изменение train_type primary
+  → проверить Qwen кеш: step_params.train_type для S4 шагов "Book", "Pay"
+  → рассмотреть возврат к regex-primary для train_type (P1.3 conservative)
+
+БЫСТРО — подключить неиспользованное (~5 строк):
+  → rerank_by_hub после ranked в enhanced_ground() → hub_scorer уже вычислен
+  → search_criteria → extra_tokens для search_advanced в _build_extra_tokens
+
+СРЕДНЕ — баги (~5 строк):
+  → get_service("luggage"): svc.name.startswith(name) вместо ==
+  → oracle_train_patterns в domain_config.yaml → удалить (dead config)
 ```

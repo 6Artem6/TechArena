@@ -10,3 +10,4 @@ graph_view.html
 *.zip
 /tt-challenge/
 *.json
+cache/

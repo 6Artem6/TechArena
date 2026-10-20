@@ -765,6 +765,12 @@ def enhanced_ground(
             ranked = [(sc + flow_ctx.boost(h, ix), h) for sc, h in ranked]
             ranked.sort(reverse=True)
 
+        # --- Hub rerank: boost handlers with many reachable top-ranked handlers ---
+        # preserve.preserve() вызывает travel/order/seat/food — все в top-N для "book".
+        # Без буста preserve выпадает из tau-окна → downstream chain пропадает.
+        if _hub_reachable:
+            ranked = rerank_by_hub(ranked, _hub_reachable, gamma=0.10, top_k=30)
+
         # view_trip с известным oracle.train_type: расширить tau-окно, чтобы travel service
         # попал в hs несмотря на высокий score preserve-service (vocabulary перекрытие в BGE-M3).
         # preserve-service доминирует ~0.85, travel2 ~0.80: стандартный tau=0.05 → порог 0.8075
@@ -834,17 +840,14 @@ def enhanced_ground(
                 sibling_mod = _sibling_of(mod)
                 if sibling_mod is None:
                     continue
-                # Оба уже в hs — disambiguation справился
                 if any(ix.module.get(h2) == sibling_mod for h2 in hs):
-                    continue
-                # Проверить: это неправильная сторона?
+                    continue  # оба уже в hs — disambiguation справился
                 wrong = (
                     (effective_train_type in ("OTHER", "D") and _is_g_service(mod)) or
                     (effective_train_type == "G" and _is_other_service(mod))
                 )
                 if not wrong:
                     continue
-                # Найти лучший обработчик правильного сиблинга в ranked
                 for _, h2 in ranked:
                     if ix.module.get(h2) == sibling_mod:
                         swapped.discard(h)

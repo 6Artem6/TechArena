@@ -65,6 +65,7 @@ USED_FILES: list[str] = [
     "src/localization/flow_graph.py",
     "src/localization/java_context.py",
     "src/localization/qwen_encoder.py",
+    "src/localization/passport_generator.py",
 
     # Parsers: Java AST — только Java-парсер нужен для enrichment
     "src/parsers/__init__.py",
@@ -168,15 +169,27 @@ def collect_code_files() -> list[tuple[Path, str]]:
     return entries
 
 
+CACHE_FILES: list[str] = [
+    "cache/service_passports.pkl",
+    "cache/qwen_encoder_cache.pkl",
+]
+
+
 def build_zip(submission: Path, archive: Path) -> None:
     code_files = collect_code_files()
-    print(f"Упаковываю {len(code_files)} файлов кода + submission.json → {archive.name}")
+    cache_files = [(ROOT / f, f"code/{f}") for f in CACHE_FILES if (ROOT / f).exists()]
+    if not cache_files:
+        print("  [WARN] cache/*.pkl не найдены — Qwen будет генерировать паспорта заново", file=sys.stderr)
+    total = len(code_files) + len(cache_files) + 1
+    print(f"Упаковываю {len(code_files)} файлов кода + {len(cache_files)} кешей + submission.json → {archive.name}")
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.write(submission, "submission.json")
         for disk_path, arc_name in code_files:
             zf.write(disk_path, arc_name)
+        for disk_path, arc_name in cache_files:
+            zf.write(disk_path, arc_name)
     size_kb = archive.stat().st_size // 1024
-    print(f"  → {archive} ({size_kb} КБ, {len(code_files) + 1} файлов)")
+    print(f"  → {archive} ({size_kb} КБ, {total} файлов)")
 
 
 def main() -> None:
