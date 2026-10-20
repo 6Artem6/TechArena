@@ -1,17 +1,28 @@
 """Фаза 2.1 — Step Typing: классификация шага сценария.
 
-Принимает action-текст шага → возвращает (step_type, params).
-step_type используется для:
-  - добавления дополнительных BM25-токенов при поиске entry point
-  - disambiguation: travel vs travel2, order vs orderOther (P-75, P-54)
-  - Oracle.parse_step() уточнение параметров
+Принимает action-текст шага → возвращает StepInfo.
+При наличии StepParams от Qwen (Pass 1) использует их как основной сигнал;
+иначе — regex-based fallback.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .._config import cfg_get
+
+if TYPE_CHECKING:
+    from src.localization.qwen_encoder import StepParams
+
+
+# Шаги, для которых Qwen keywords безопасно инжектировать в extra_tokens.
+# Для search/* и view_trip keywords ("cheapest", "trips") сдвигают BM25 вредно.
+_SAFE_KEYWORD_TYPES = frozenset({
+    "book", "pay", "cancel", "collect", "rebook",
+    "enter_station", "add_consign", "query_consign",
+    "check_price", "check_refund",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -65,48 +76,9 @@ _PAY_EMPTY    = re.compile(r"\binternal\b.{0,50}\bempty\b", re.I)
 # ---------------------------------------------------------------------------
 
 def _load_step_rules() -> list[tuple[str, list[str]]]:
-    """Загрузить правила из конфига; fallback — встроенный список."""
+    """Загрузить правила из конфига (fallback когда Qwen недоступен или вернул 'other')."""
     raw = cfg_get("step_rules", [])
-    if raw:
-        return [(r["type"], r["patterns"]) for r in raw]
-    # Встроенный fallback (дублирует YAML для случая отсутствия конфига)
-    return [
-        ("query_consign",  ["look up.*consign", "look up.*luggage",
-                            "consignment record", "luggage consignment.*registered",
-                            r"check what.*consign", "list of.*consign"]),
-        ("add_consign",    [r"^add.*consign", r"^register.*consign"]),
-        ("register",       [r"^register\b", "sign up", "create account",
-                            r"\bnew account\b", "new passenger"]),
-        ("admin_login",    ["admin console"]),
-        ("login",          ["log in", "login", "sign in"]),
-        ("book",           [r"^book\b", r"^purchase\b", r"^reserve\b", r"^buy\b",
-                            "order a ticket"]),
-        ("pay",            [r"^pay\b", "payment"]),
-        ("cancel",         [r"^cancel\b"]),
-        ("rebook",         ["rebook", "change seat", "change ticket", "change the trip"]),
-        ("collect",        [r"^collect\b", "pick up", "take the ticket"]),
-        ("enter_station",  [r"enter.+station", r"\bboard.+train", r"\bboard.+order"]),
-        ("search_advanced", ["^advanced search", r"cheapest\s+trips", r"quickest\s+trips",
-                             "fewest.stop"]),
-        ("search_train",   ["search", "find train", "find trip", "trips from",
-                            "trains from", "departing"]),
-        ("view_trip",      ["open the details", "details of the", "first trip found",
-                            "trip found", "cheapest trip found", "open.*order"]),
-        ("query_food_trip", ["food menu", "food offered on", "meal"]),
-        ("browse_food_station", ["food store", "browse food", "station food",
-                                 r"food at .* station"]),
-        ("add_contact",    ["add a contact", "add a new contact", r"^add.*contact\b"]),
-        ("get_contact",    ["contact book", "first contact", "open.*contact",
-                            "take.*contact"]),
-        ("query_orders",   ["list of orders", "refresh.*order", "orders.*high.speed",
-                            "orders.*regular", "orders.*paid", "order.*status",
-                            "view.*orders", "orders for"]),
-        ("add_station",    ["add.*station", "new station"]),
-        ("add_train_type", ["add.*train type", "new train type", "gaoties"]),
-        ("add_route",      ["add.*route", "new route"]),
-        ("add_trip",       ["add.*trip", "open.*trip", "new trip"]),
-        ("query_orders",   ["paid", "filter.*paid", "paid.*filter"]),
-    ]
+    return [(r["type"], r["patterns"]) for r in raw]
 
 
 _STEP_RULES: list[tuple[str, list[str]]] = _load_step_rules()
@@ -128,13 +100,7 @@ class StepInfo:
     extra_tokens: list[str] = field(default_factory=list)
 
 
-def classify(action: str) -> StepInfo:
-    """Классифицировать текст шага, вернуть StepInfo."""
-    text = action.lower()
-    info = StepInfo()
-
-    # --- Определить train_type ---
-    # NOT_G проверяется первым: "not high-speed" не должно давать train_type=G
+def _apply_train_type(text: str, info: StepInfo) -> None:
     if _NOT_G_TRAIN.search(text):
         info.train_type = "OTHER"
     elif _G_TRAIN.search(text):
@@ -142,44 +108,103 @@ def classify(action: str) -> StepInfo:
     elif _OTHER_TRAIN.search(text):
         info.train_type = "OTHER"
 
-    # --- Определить seat_class ---
+
+def _apply_seat_class(text: str, info: StepInfo) -> None:
     if _SEAT_FIRST.search(text):
         info.seat_class = "FIRST"
     elif _SEAT_SECOND.search(text):
         info.seat_class = "SECOND"
 
-    # --- Определить дополнительные опции ---
+
+def _apply_food(text: str, info: StepInfo) -> None:
     if _HAS_FOOD.search(text) and not _NO_FOOD.search(text):
         info.has_food = True
     elif _NO_FOOD.search(text):
         info.has_food = False
 
+
+def _apply_insurance(text: str, info: StepInfo) -> None:
     if _HAS_INS.search(text) and not _NO_INS.search(text):
         info.has_insurance = True
     elif _NO_INS.search(text):
         info.has_insurance = False
 
+
+def _apply_luggage(text: str, info: StepInfo) -> None:
     if _HAS_LUG.search(text) and not _NO_LUG.search(text):
         info.has_luggage = True
     elif _NO_LUG.search(text):
         info.has_luggage = False
 
-    # --- Определить step_type ---
-    for step_type, keywords in _STEP_RULES:
-        for kw in keywords:
-            if re.search(kw, text, re.I):
-                info.step_type = step_type
+
+def _apply_options(text: str, info: StepInfo) -> None:
+    _apply_food(text, info)
+    _apply_insurance(text, info)
+    _apply_luggage(text, info)
+
+
+def classify(action: str, step_params: "StepParams | None" = None) -> StepInfo:
+    """Классифицировать текст шага, вернуть StepInfo.
+
+    step_params: StepParams от Qwen Pass 1 (основной путь).
+    Если None — regex-based fallback.
+    """
+    text = action.lower()
+    info = StepInfo()
+
+    # train_type — всегда regex: D-train→G mapping намеренный, Qwen не знает этот трюк.
+    # step_type — Qwen primary (NL-понимание шире regex), regex как fallback.
+    _apply_train_type(text, info)
+    _apply_seat_class(text, info)
+
+    if step_params is not None and step_params.step_type not in ("other", "unknown", ""):
+        info.step_type = step_params.step_type
+    else:
+        for step_type, keywords in _STEP_RULES:
+            for kw in keywords:
+                if re.search(kw, text, re.I):
+                    info.step_type = step_type
+                    break
+            if info.step_type != "unknown":
                 break
-        if info.step_type != "unknown":
-            break
 
-    # --- Сформировать extra_tokens для BM25 ---
-    info.extra_tokens = _build_extra_tokens(info, action)
+    if step_params is not None:
+        # --- Qwen path: структурные атрибуты бронирования ---
+        # services: food_train, food_station, insurance, luggage
+        food_train   = step_params.get_service("food_train")
+        food_station = step_params.get_service("food_station")
+        if food_train is True or food_station is True:
+            info.has_food = True
+        elif food_train is False and food_station is False:
+            info.has_food = False
+        else:
+            _apply_food(text, info)
 
+        ins = step_params.get_service("insurance")
+        if ins is not None:
+            info.has_insurance = ins
+        else:
+            _apply_insurance(text, info)
+
+        lug = step_params.get_service("luggage")
+        if lug is not None:
+            info.has_luggage = lug
+        else:
+            _apply_luggage(text, info)
+
+    else:
+        # --- Regex fallback (Qwen недоступен) ---
+        _apply_options(text, info)
+
+    info.extra_tokens = _build_extra_tokens(info, action, step_params)
     return info
 
 
-def _build_extra_tokens(info: StepInfo, action: str = "") -> list[str]:
+def _build_extra_tokens(
+    info: StepInfo,
+    action: str = "",
+    step_params: "StepParams | None" = None,
+) -> list[str]:
     """Формирует структурные BM25-токены из параметров бронирования.
 
     Семантический мост NL → code (action vocabulary) заменён dense-векторами
@@ -210,12 +235,13 @@ def _build_extra_tokens(info: StepInfo, action: str = "") -> list[str]:
     # rebook: "rebook" x2 extra → triple "rebook" в query; rebook.rebook имеет TF=3 vs payDifference TF=2
     if info.step_type == "rebook":
         tokens.extend(["rebook", "rebook"])
-    # pay: "external" или "internal ... empty" → outside-payment; "internal" без этих признаков → inside-payment
+
+    # pay: использовать payment_mode из StepParams если доступен, иначе regex
     if info.step_type == "pay":
-        if _PAY_EXTERNAL.search(action) or _PAY_EMPTY.search(action):
-            # "payment service" — семантический сигнал для BGE-M3: ts-payment-service (не inside)
+        _pm = step_params.payment_mode if step_params is not None else ""
+        if _pm == "external" or (not _pm and (_PAY_EXTERNAL.search(action) or _PAY_EMPTY.search(action))):
             tokens.extend(["payment", "payment", "service"])
-        elif _PAY_INTERNAL.search(action):
+        elif _pm == "internal" or (not _pm and _PAY_INTERNAL.search(action)):
             tokens.append("inside")
 
     # check_price: "price"×2 — усилить сигнал price vs order (queryOrdersForRefresh шумит)
@@ -236,5 +262,13 @@ def _build_extra_tokens(info: StepInfo, action: str = "") -> list[str]:
     # "refund" из action уже есть в query; "calculate" добавляет прямой сигнал сервиса
     if info.step_type == "check_refund":
         tokens.extend(["calculate", "refund"])
+
+    # Qwen keywords: инжектировать только для безопасных step_types
+    if (step_params is not None
+            and step_params.keywords
+            and info.step_type in _SAFE_KEYWORD_TYPES):
+        for kw in step_params.keywords:
+            if kw and kw not in tokens:
+                tokens.append(kw)
 
     return tokens

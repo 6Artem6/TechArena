@@ -21,7 +21,7 @@ sys.path.insert(0, str(_HERE))
 from src.core.nlp import expand, query_toks, ADMIN, toks  # noqa: E402
 from src.localization.step_typer import classify  # noqa: E402
 from src.localization.service_matcher import ServiceMatcher  # noqa: E402
-from src.graph.siblings import detect_all_siblings, _strip  # noqa: E402
+from src.graph.siblings import _strip  # noqa: E402
 from src.trace.oracle import Oracle  # noqa: E402
 from src.similarity.encoder import SemanticReranker  # noqa: E402
 from src.similarity.code_encoder import CodeEncoder  # noqa: E402
@@ -31,22 +31,6 @@ from src.localization.session_context import SessionContext  # noqa: E402
 from src.localization.java_context import build_java_context, build_nl_enrichment  # noqa: E402
 from src.localization.qwen_encoder import QwenEncoder, get_candidate_handlers_indexed  # noqa: E402
 
-
-# Типы шагов, которые наследуют train_type из предыдущего шага через oracle carry-over.
-# "search_train" устанавливает train_type, эти шаги используют его если не переопределили сами.
-_STEP_TYPES_USE_CONTEXT = frozenset({
-    "book", "pay", "collect", "cancel", "rebook",
-    "view_trip", "query_food_trip",
-    "add_consign", "query_consign", "change_seat",
-})
-
-# Типы шагов для которых Pass 1 search_keywords безопасны.
-# Для search/search_advanced/view_trip keywords вроде "cheapest"/"trips" сдвигают BM25 вредно.
-_SAFE_KEYWORD_TYPES = frozenset({
-    "book", "pay", "cancel", "collect", "rebook",
-    "enter_station", "add_consign", "query_consign",
-    "check_price", "check_refund",
-})
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +61,15 @@ _CODE_ENCODERS: "list[tuple[CodeEncoder, float]]" = []  # [(encoder, gamma), ...
 
 # Qwen2.5-Coder query decomposer (ollama, локальный)
 _QWEN_ENCODER: "QwenEncoder | None" = None
+
+# SV.1: Bottom-up service validation — token sets для паспортов на уровне сервиса.
+# _SERVICE_PASSPORT_TOKS: все токены (для отладки/расширения).
+# _SV_DISTINCTIVE_TOKS:   только токены встречающиеся в ≤ SV_MAX_SVC_FREQ сервисах
+#   — исключает 'retrieve','specific','create' (встречаются у многих) → снижает FP.
+_SERVICE_PASSPORT_TOKS: "dict[str, frozenset[str]] | None" = None
+_SV_DISTINCTIVE_TOKS:   "dict[str, frozenset[str]] | None" = None
+_SV_GAMMA      = 0.12   # вес service-level boost
+_SV_MAX_SVC_FREQ = 0.30  # порог: токен характерен если в ≤30% сервисов
 
 # Корпус BM25 (code + ui) — передаётся из predict._build_index() для обогащения doc_texts
 _CODE_DOCS: "dict[str, list[str]] | None" = None
@@ -110,7 +103,7 @@ _STEP_CLASSIFY_CACHE: dict[str, object] = {}
 def batch_classify_steps(actions: list[str]) -> list:
     """Pass 1: параллельная классификация шагов сценария через Qwen.
 
-    Возвращает list[QwenClassifyOutput] в том же порядке что и actions.
+    Возвращает list[StepParams] в том же порядке что и actions.
     Пустой список если Qwen недоступен.
     Инициализирует QwenEncoder если ещё не запущен (он может быть вызван
     до enhanced_ground, поэтому не ждём _init_service_matcher).
@@ -204,6 +197,43 @@ def _init_service_matcher(ix) -> None:
     from src.localization.passport_generator import load_or_generate_passports
     _passports = load_or_generate_passports(ix, _TARGETS_ROOT, _QWEN_ENCODER)
 
+    # SV.1: Агрегировать паспорта на уровне сервиса для bottom-up валидации.
+    # {module → frozenset(tokens)} — все synonyms + business_summary по сервису.
+    global _SERVICE_PASSPORT_TOKS
+    _svc_tok_sets: dict[str, set[str]] = {}
+    for _nid, _p in _passports.items():
+        _mod = ix.module.get(_nid, "")
+        if not _mod:
+            continue
+        _agg = _p.business_summary + " " + " ".join(_p.synonyms)
+        _svc_tok_sets.setdefault(_mod, set()).update(
+            t for t in toks(_agg) if len(t) > 2
+        )
+    # SV.2: Расширить service-token sets из service profiles (bm25_keywords).
+    # Profiles выводятся алгоритмически из паспортов — без доп. Qwen-вызовов.
+    # _STOP в gen_service_profiles.py уже убрал 'order','ticket','train'.
+    from src.localization.service_profiles import load_profiles as _load_svc_profiles
+    for _mod, _prof in _load_svc_profiles().items():
+        _existing = _svc_tok_sets.setdefault(_mod, set())
+        _existing.update(t for t in toks(" ".join(_prof.bm25_keywords)) if len(t) > 2)
+    _SERVICE_PASSPORT_TOKS = {m: frozenset(v) for m, v in _svc_tok_sets.items()}
+
+    # SV.1 distinctive: оставить только токены встречающиеся в ≤ _SV_MAX_SVC_FREQ сервисах.
+    # 'retrieve','specific','create','information' — у многих → шум → исключить.
+    global _SV_DISTINCTIVE_TOKS
+    _n_svcs = max(len(_svc_tok_sets), 1)
+    _tok_freq: dict[str, int] = {}
+    for _tok_set in _svc_tok_sets.values():
+        for _t in _tok_set:
+            _tok_freq[_t] = _tok_freq.get(_t, 0) + 1
+    _SV_DISTINCTIVE_TOKS = {
+        _m: frozenset(
+            _t for _t in _ts
+            if _tok_freq.get(_t, 0) <= _n_svcs * _SV_MAX_SVC_FREQ
+        )
+        for _m, _ts in _svc_tok_sets.items()
+    }
+
     # SemanticReranker: построить doc_texts и инициализировать BGE-M3
     _RERANKER = SemanticReranker()
     if _RERANKER.enabled:
@@ -274,11 +304,12 @@ def _init_service_matcher(ix) -> None:
                     extra_parts.append(nl_tok)
                     seen.add(nl_tok)
 
-            # Passport synonyms: Qwen-генерированные бизнес-термины из кода контроллера.
-            # Не фильтруются через _is_informative — они уже специфичны для данного endpoint.
+            # Passport synonyms для BGE-M3: только top-4 чтобы не добавлять generic шум.
+            # CE doc_texts получают полный паспорт (строка 310+) — CE с cross-attention
+            # лучше справляется с шумом, чем BM25-индекс по BGE-M3 doc_texts.
             _p = _passports.get(nid)
             if _p:
-                for _syn in _p.synonyms[:8]:
+                for _syn in _p.synonyms[:4]:
                     for _tok in toks(_syn):
                         if len(_tok) > 2 and _tok not in seen:
                             extra_parts.append(_tok)
@@ -320,22 +351,6 @@ def _init_service_matcher(ix) -> None:
     )
 
 
-def _is_g_side(a: str, b: str, reason: str) -> bool:
-    """Определить G-сторону в паре сиблингов.
-
-    Для G-поездов: сервис без суффикса -other и без цифры в конце.
-    """
-    a_s = _strip(a)
-    if reason.startswith("other_variant"):
-        return not a_s.endswith("-other")
-    if reason.startswith("numeric_variant"):
-        return not (a_s and a_s[-1].isdigit())
-    # trigram / прочие: более короткое имя = G-сторона (эвристика)
-    return len(a_s) <= len(_strip(b))
-
-
-_GOTHER_REASONS = frozenset({"other_variant", "numeric_variant"})
-
 # Кеш func_variant пар: module → (sibling_module, is_basic_side)
 # basic = без функционального суффикса (travel); plan = с суффиксом (travel-plan)
 _FUNC_VARIANT_MAP: dict[str, tuple[str, bool]] | None = None
@@ -346,51 +361,50 @@ _BASIC_SEARCH_TYPES = frozenset({"search_train"})
 _PLAN_SEARCH_TYPES = frozenset({"search_advanced"})
 
 
+_SIBLING_METADATA_PATH = Path(__file__).parents[2] / "cache" / "sibling_metadata.json"
+
+
 def _init_sibling_map(ix) -> None:
-    """Вычислить кеш сиблингов из модулей index (один раз).
+    """Загрузить кеш сиблингов из sibling_metadata.json (офлайн скомпилированный).
 
-    G/OTHER пары (train type disambiguation):
-    - numeric_variant: ts-travel-service / ts-travel2-service
-    - other_variant: ts-order-service / ts-order-other-service
-    - trigram_cosine: нестандартные пары
-
-    Func-variant пары (basic/plan step_type disambiguation, P-75):
-    - func_variant: ts-travel-service / ts-travel-plan-service
-    - func_variant: ts-route-service / ts-route-plan-service
+    Офлайн-генерация: python scripts/gen_sibling_metadata.py
     """
     global _SIBLING_MAP, _FUNC_VARIANT_MAP
     if _SIBLING_MAP is not None:
         return
 
-    modules = list(set(ix.module.values()))
-    pairs = detect_all_siblings(modules)
-
     mapping: dict[str, tuple[str, bool]] = {}
     func_map: dict[str, tuple[str, bool]] = {}
 
-    for a, b, _weight, reason in pairs:
-        base_reason = reason.split("(")[0]
+    if not _SIBLING_METADATA_PATH.exists():
+        import sys as _sys
+        print("[searcher] sibling_metadata.json не найден — запустите gen_sibling_metadata.py", file=_sys.stderr)
+        _SIBLING_MAP = mapping
+        _FUNC_VARIANT_MAP = func_map
+        return
 
-        if base_reason == "func_variant":
-            # Func-variant: shorter stripped name = basic side (без суффикса)
-            a_s, b_s = _strip(a), _strip(b)
-            a_is_basic = len(a_s) <= len(b_s)
-            basic_svc = a if a_is_basic else b
-            plan_svc  = b if a_is_basic else a
-            if basic_svc not in func_map and plan_svc not in func_map:
-                func_map[basic_svc] = (plan_svc, True)   # True = basic сторона
-                func_map[plan_svc]  = (basic_svc, False) # False = plan сторона
+    import json as _json
+    meta = _json.loads(_SIBLING_METADATA_PATH.read_text())
+    seen_pairs: set[frozenset] = set()
+    for svc, d in meta.items():
+        sib = d.get("sibling", "")
+        vtype = d.get("variant_type", "")
+        pair_key = frozenset({svc, sib})
+        if not sib or pair_key in seen_pairs:
             continue
-
-        # Фильтр: только G/OTHER пары для train_type disambiguation
-        if base_reason not in _GOTHER_REASONS and not base_reason.startswith("trigram"):
-            continue
-        g_is_a = _is_g_side(a, b, reason)
-        g_svc = a if g_is_a else b
-        o_svc = b if g_is_a else a
-        if g_svc not in mapping and o_svc not in mapping:
+        seen_pairs.add(pair_key)
+        if vtype == "primary_variant":
+            g_svc = svc if d.get("is_g_side") else sib
+            o_svc = sib if d.get("is_g_side") else svc
             mapping[g_svc] = (o_svc, True)
             mapping[o_svc] = (g_svc, False)
+        elif vtype == "func_variant":
+            basic_svc = svc if d.get("is_basic_side") else sib
+            plan_svc  = sib if d.get("is_basic_side") else svc
+            if basic_svc not in func_map and plan_svc not in func_map:
+                func_map[basic_svc] = (plan_svc, True)
+                func_map[plan_svc]  = (basic_svc, False)
+        # admin_variant — не загружается в runtime-карты, только в metadata для наблюдаемости
 
     _SIBLING_MAP = mapping
     _FUNC_VARIANT_MAP = func_map
@@ -524,31 +538,23 @@ def _disambiguate_func_variant(hs: set[str], step_type: str, ix, ranked: list | 
     return result
 
 
-# Таблица: step_type → глагол-ключ в имени метода.
-# Для cancel/rebook/register: предпочитаем handler чьё имя содержит этот глагол.
-_STEP_TYPE_VERB: dict[str, str] = {
-    "cancel": "cancel",
-    "rebook": "rebook",
-    "register": "register",
-}
+# step_types для которых action-verb совпадает с именем entry-point метода.
+# Для этих шагов предпочитаем handler чьё имя содержит step_type как подстроку.
+# (frozenset вместо dict: key == value было тривиальным)
+_ACTION_STEP_TYPES = frozenset({"cancel", "rebook", "register"})
 
 
-def _prefer_step_typed_handler(
-    hs: set[str], step_type: str, ix, ranked: list
+def _prefer_step_type_handler(
+    hs: set[str], step_type: str, ix, ranked: list,
+    reranker=None, doc_texts=None,
 ) -> set[str]:
-    """Предпочесть handler с именем, содержащим глагол шага.
+    """Для action-шагов: выбрать handler чьё имя содержит step_type.
 
-    Для cancel/rebook: если в tau-window несколько handler'ов одного модуля
-    и один из них содержит verb в имени метода → оставить только его.
-    Если typed handler вне tau-window → принудительно добавить из ranked
-    (force-swap), убрав нетипизированный.
-
-    Примеры:
-      cancel step → cancelTicket (vs calculate) — cancelTicket имеет "cancel"
-      rebook step → rebook.rebook (vs payDifference) — rebook.rebook имеет "rebook"
+    REST API соглашение: entry-point называется по своему действию
+    (cancelTicket, rebook, registerUser). При нескольких кандидатах в модуле
+    предпочитаем точно названный. Если он вне tau-window — force-swap из ranked.
     """
-    verb = _STEP_TYPE_VERB.get(step_type, "")
-    if not verb or not hs:
+    if not hs or step_type not in _ACTION_STEP_TYPES:
         return hs
 
     by_mod: dict[str, list[str]] = {}
@@ -557,27 +563,26 @@ def _prefer_step_typed_handler(
 
     result = set(hs)
     for mod, handlers in by_mod.items():
-        typed   = [h for h in handlers if verb in ix.N.get(h, {}).get("name", "").lower()]
-        untyped = [h for h in handlers if verb not in ix.N.get(h, {}).get("name", "").lower()]
+        typed   = [h for h in handlers if step_type in ix.N.get(h, {}).get("name", "").lower()]
+        untyped = [h for h in handlers if step_type not in ix.N.get(h, {}).get("name", "").lower()]
 
         if typed:
-            # Typed handler уже в окне → убрать нетипизированных из того же модуля
             for h in untyped:
                 result.discard(h)
         elif untyped:
-            # Typed handler вне tau-window → force-swap из ranked (сначала тот же модуль, затем любой)
+            # Typed handler вне tau-window → force-swap из ranked (тот же модуль)
             found = False
             for _, h2 in ranked:
                 if (ix.module.get(h2) == mod
-                        and verb in ix.N.get(h2, {}).get("name", "").lower()):
+                        and step_type in ix.N.get(h2, {}).get("name", "").lower()):
                     for h in untyped: result.discard(h)
                     result.add(h2)
                     found = True
                     break
             if not found:
-                # Если verb нет в текущем модуле → ищем в любом модуле ranked (cross-module swap)
+                # Cross-module swap как последнее средство
                 for _, h2 in ranked:
-                    if verb in ix.N.get(h2, {}).get("name", "").lower():
+                    if step_type in ix.N.get(h2, {}).get("name", "").lower():
                         for h in untyped: result.discard(h)
                         result.add(h2)
                         break
@@ -627,17 +632,10 @@ def enhanced_ground(
         q = expand(query_toks(act))
 
         # --- Шаг 2: step_type + extra_tokens (Фаза 2.1) ---
-        step_info = classify(act)
-
-        # Pass 1: применять search_keywords только для шагов где они безопасны.
-        # Для search/search_advanced/view_trip keywords "cheapest"/"trips" сдвигают BM25 вредно.
-        # Для book/pay/cancel/collect keywords "inside"/"first class" безопасны и помогают.
+        # Pass 1: StepParams от Qwen — основной источник классификации.
+        # Если Qwen недоступен — step_info строится из regex (fallback в classify()).
         _qwen_classify = get_step_classify(act)
-        if (_qwen_classify is not None and _qwen_classify.search_keywords
-                and step_info.step_type in _SAFE_KEYWORD_TYPES):
-            step_info.extra_tokens = list(set(
-                step_info.extra_tokens + _qwen_classify.search_keywords
-            ))
+        step_info = classify(act, step_params=_qwen_classify)
 
         # Обновить admin-контекст по типу шага (carry-over смены роли)
         if step_info.step_type == "admin_login":
@@ -765,11 +763,22 @@ def enhanced_ground(
             ranked = [(sc + flow_ctx.boost(h, ix), h) for sc, h in ranked]
             ranked.sort(reverse=True)
 
-        # --- Hub rerank: boost handlers with many reachable top-ranked handlers ---
-        # preserve.preserve() вызывает travel/order/seat/food — все в top-N для "book".
-        # Без буста preserve выпадает из tau-окна → downstream chain пропадает.
-        if _hub_reachable:
-            ranked = rerank_by_hub(ranked, _hub_reachable, gamma=0.10, top_k=30)
+        # --- SV.1: Service-level passport/profile boost ---
+        # Использует _SV_DISTINCTIVE_TOKS — токены встречающиеся в ≤30% сервисов.
+        # Только такие токены дискриминируют; 'retrieve','specific' не считаются.
+        if _SV_DISTINCTIVE_TOKS and ranked:
+            _q_frset = frozenset(q)
+            _sv_ranked = []
+            for _sv_sc, _sv_h in ranked:
+                _sv_mod = ix.module.get(_sv_h, "")
+                _sv_toks = _SV_DISTINCTIVE_TOKS.get(_sv_mod, frozenset())
+                _sv_overlap = len(_q_frset & _sv_toks)
+                if _sv_overlap > 0:
+                    _sv_boost = min(_sv_overlap / max(len(_q_frset), 1), 1.0) * _SV_GAMMA
+                    _sv_ranked.append((_sv_sc * (1 + _sv_boost), _sv_h))
+                else:
+                    _sv_ranked.append((_sv_sc, _sv_h))
+            ranked = sorted(_sv_ranked, reverse=True)
 
         # view_trip с известным oracle.train_type: расширить tau-окно, чтобы travel service
         # попал в hs несмотря на высокий score preserve-service (vocabulary перекрытие в BGE-M3).
@@ -816,13 +825,11 @@ def enhanced_ground(
                     break
 
         # --- Шаг 5: disambiguation travel/order по train_type ---
-        # carry-over: шаги из _STEP_TYPES_USE_CONTEXT наследуют train_type из oracle
-        # если сам шаг не упоминает тип поезда явно (P-54)
+        # carry-over: если шаг не упоминает тип поезда явно — наследуем из oracle.
+        # Oracle обновляется только при явном train_type в тексте шага (parse_step),
+        # поэтому наследование всегда безопасно для всех типов шагов (P-54).
         effective_train_type = step_info.train_type
-        if (not effective_train_type
-                and oracle is not None
-                and oracle.train_type
-                and step_info.step_type in _STEP_TYPES_USE_CONTEXT):
+        if not effective_train_type and oracle is not None and oracle.train_type:
             effective_train_type = oracle.train_type
         hs = _disambiguate(hs, effective_train_type, ix)
 
@@ -840,14 +847,17 @@ def enhanced_ground(
                 sibling_mod = _sibling_of(mod)
                 if sibling_mod is None:
                     continue
+                # Оба уже в hs — disambiguation справился
                 if any(ix.module.get(h2) == sibling_mod for h2 in hs):
-                    continue  # оба уже в hs — disambiguation справился
+                    continue
+                # Проверить: это неправильная сторона?
                 wrong = (
                     (effective_train_type in ("OTHER", "D") and _is_g_service(mod)) or
                     (effective_train_type == "G" and _is_other_service(mod))
                 )
                 if not wrong:
                     continue
+                # Найти лучший обработчик правильного сиблинга в ranked
                 for _, h2 in ranked:
                     if ix.module.get(h2) == sibling_mod:
                         swapped.discard(h)
@@ -855,10 +865,9 @@ def enhanced_ground(
                         break
             hs = swapped
 
-        # cancel/rebook: предпочесть handler с именем-глаголом шага
-        # (cancelTicket vs calculate, rebook.rebook vs rebook.payDifference).
-        # Вызывается до top-1 per module: меняет состав hs, не только порядок.
-        hs = _prefer_step_typed_handler(hs, step_info.step_type, ix, ranked)
+        # action-шаги: предпочесть handler с именем, содержащим step_type
+        # (cancelTicket, rebook.rebook, registerUser).
+        hs = _prefer_step_type_handler(hs, step_info.step_type, ix, ranked)
 
         # External pay: добавить best handler из external payment service в entry points.
         # Оба и inside-payment И external payment участвуют в execution trace

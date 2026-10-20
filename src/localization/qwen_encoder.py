@@ -37,7 +37,7 @@ _HF_MODEL_NAME       = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 _TIMEOUT_S           = 10
 _NUM_PREDICT         = 40   # индекс = 1-3 цифры, нет нужды в 160 токенах
 _MIN_CONFIDENCE      = 0.55  # инжект только при confidence >= этого порога
-_CACHE_FILE          = Path.home() / ".cache" / "qwen_encoder_cache.pkl"
+_CACHE_FILE          = Path(__file__).parents[2] / "cache" / "qwen_encoder_cache.pkl"
 
 
 # ---------------------------------------------------------------------------
@@ -81,77 +81,134 @@ class QwenOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Pass 1: classify-only output (step_type + search_keywords, без кандидатов)
+# Pass 1: classify-only output — StepParams (структурированный контракт шага)
 # ---------------------------------------------------------------------------
 
-class QwenClassifyOutput(BaseModel):
-    """Результат Pass 1: тип шага + ключевые слова для поиска handler-а.
+class ServiceItem(BaseModel):
+    """Явно упомянутый сервис в тексте шага."""
+    name: str     # food_train | food_station | insurance | luggage
+    present: bool
 
-    step_type       — тип действия пользователя (login/book/pay/search_transit/...)
-    search_keywords — 1–4 токена для BM25-запроса (заменяют extra_tokens step_typer)
+
+class StepParams(BaseModel):
+    """Результат Pass 1: полный структурированный контракт шага.
+
+    Заменяет regex-based классификацию в step_typer.py.
+    Все поля выводятся Qwen из natural language текста шага.
     """
-    step_type: str = Field(default="other")
-    search_keywords: list[str] = Field(default_factory=list)
+    step_type:       str              = Field(default="other")
+    train_type:      str              = Field(default="")    # "G" | "OTHER" | ""
+    seat_class:      str              = Field(default="")    # "FIRST" | "SECOND" | ""
+    services:        list[ServiceItem] = Field(default_factory=list)
+    payment_mode:    str              = Field(default="")    # "internal" | "external" | ""
+    search_criteria: list[str]        = Field(default_factory=list)  # cheapest/quickest/fewest_stops/transfer
+    order_filter:    str              = Field(default="")    # "status:Paid" | "status:Cancel" | "date:travel" | ""
+    actor_role:      str              = Field(default="")    # "passenger" | "admin" | ""
+    keywords:        list[str]        = Field(default_factory=list)   # BM25 extra terms
 
     @classmethod
-    def from_raw(cls, raw: dict) -> "QwenClassifyOutput":
+    def from_raw(cls, raw: dict) -> "StepParams":
         try:
             return cls.model_validate(raw)
         except Exception:
             st = str(raw.get("step_type", "other")).strip() or "other"
-            kw = raw.get("search_keywords", [])
-            if isinstance(kw, list):
-                kw = [str(k) for k in kw if k]
-            else:
-                kw = []
-            return cls(step_type=st, search_keywords=kw)
+            return cls(step_type=st)
+
+    def get_service(self, name: str) -> "bool | None":
+        """True/False если сервис явно упомянут, None если нет данных."""
+        for svc in self.services:
+            if svc.name == name:
+                return svc.present
+        return None
+
+
+# Обратная совместимость: старое имя класса → StepParams
+QwenClassifyOutput = StepParams
 
 
 _CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {
-        "step_type": {"type": "string"},
-        "search_keywords": {"type": "array", "items": {"type": "string"}},
+        "step_type":       {"type": "string"},
+        "train_type":      {"type": "string"},
+        "seat_class":      {"type": "string"},
+        "services": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name":    {"type": "string"},
+                    "present": {"type": "boolean"},
+                },
+                "required": ["name", "present"],
+            },
+        },
+        "payment_mode":    {"type": "string"},
+        "search_criteria": {"type": "array", "items": {"type": "string"}},
+        "order_filter":    {"type": "string"},
+        "actor_role":      {"type": "string"},
+        "keywords":        {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["step_type", "search_keywords"],
+    "required": [
+        "step_type", "train_type", "seat_class", "services",
+        "payment_mode", "search_criteria", "order_filter", "actor_role", "keywords",
+    ],
 }
 
 _CLASSIFY_SYSTEM = (
-    "You are classifying user actions in a web application.\n"
-    "Given a user action, return:\n"
-    "  step_type: EXACTLY one of these values:\n"
-    "    login, register, book, pay, cancel, rebook, collect,\n"
-    "    search, search_advanced, search_transit,\n"
-    "    view_trip, query_orders, query_consign, add_consign,\n"
-    "    add_contact, get_contact, browse_food_station, query_food_trip,\n"
-    "    check_price, check_refund, enter_station, admin_login,\n"
-    "    add_station, add_train_type, add_route, add_trip, other\n"
-    "  search_keywords: 0-3 technical terms useful for finding the correct API handler\n\n"
-    "CRITICAL rules:\n"
-    "  - search_transit = ONLY when action explicitly mentions transfer/connection/via/layover\n"
-    "  - search_advanced = advanced search for cheapest/quickest/fewest-stops (NOT transit)\n"
-    "  - search = basic train search (no advanced criteria, no transfer)\n"
-    "  - add_trip = adding a new trip/journey to the schedule (NOT add_consign!)\n"
-    "  - search_keywords: DO NOT add city names, train numbers, dates; DO add payment/class/option\n\n"
+    "You are a train ticket system action classifier.\n"
+    "Extract these fields from the user action text:\n\n"
+    "step_type: ONE of: login, register, book, pay, cancel, rebook, collect,\n"
+    "  search_train, search_advanced, search_transit, view_trip, query_orders,\n"
+    "  query_consign, add_consign, update_consign, add_contact, get_contact,\n"
+    "  browse_food_station, query_food_trip, check_price, check_refund, query_insurance,\n"
+    "  enter_station, admin_login, add_station, add_train_type, add_route, add_trip, add_price, other\n\n"
+    "train_type: \"G\" (high-speed/bullet/gaotie/CRH/DongChe/D-type), "
+    "\"OTHER\" (regular/slow/non-high-speed), \"\" (unknown)\n"
+    "seat_class: \"FIRST\" (first-class/business), \"SECOND\" (second-class/economy), \"\" (unknown)\n"
+    "services: list ONLY explicitly mentioned services:\n"
+    "  food_train (food on the train), food_station (food at the station),\n"
+    "  insurance/assurance, luggage/consign — each as {name, present:true/false}\n"
+    "payment_mode: \"internal\" (internal balance), \"external\" (external service/balance empty), \"\" (unknown)\n"
+    "search_criteria: mention any of: cheapest, quickest, fewest_stops, transfer\n"
+    "order_filter: \"status:Paid\", \"status:Cancel\", \"date:travel\", \"date:purchase\", or \"\"\n"
+    "actor_role: \"admin\" (admin context), \"passenger\" (user context), \"\" (unknown)\n"
+    "keywords: 0-3 BM25 terms for finding the API handler (no city names, no train numbers)\n\n"
+    "RULES:\n"
+    "  search_transit = ONLY when transfer/connection/via/layover explicitly mentioned\n"
+    "  search_advanced = cheapest/quickest/fewest-stops (no transfer)\n"
+    "  services: omit unmentioned services (keep array short)\n"
+    "  keywords: for pay add payment signal; for book add seat/service signals; skip for search\n\n"
     "Examples:\n"
-    '  "ask for trips with a transfer via Suzhou" → search_transit, ["transfer"]\n'
-    '  "advanced search: cheapest trips" → search_advanced, []\n'
-    '  "advanced search: quickest trips" → search_advanced, []\n'
-    '  "advanced search: fewest stops" → search_advanced, []\n'
-    '  "search high-speed trains from A to B" → search, []\n'
-    '  "pay from internal account balance" → pay, ["inside"]\n'
-    '  "pay using external payment service" → pay, ["payment", "service"]\n'
-    '  "book first-class seat with food" → book, ["first class", "food"]\n'
-    '  "add a new trip G101 on route X" → add_trip, []\n'
-    '  "add a new station Ning Bo" → add_station, []\n'
-    '  "log in to admin console" → admin_login, []\n'
-    '  "open details of cheapest trip" → view_trip, []\n'
-    '  "view trip details" → view_trip, []\n'
-    '  "check trip detail information" → view_trip, []\n'
-    'Output ONLY valid JSON: {"step_type": "...", "search_keywords": [...]}. No other text.'
+    '  "book first-class with food on train and insurance" → '
+    '{"step_type":"book","train_type":"","seat_class":"FIRST",'
+    '"services":[{"name":"food_train","present":true},{"name":"insurance","present":true}],'
+    '"payment_mode":"","search_criteria":[],"order_filter":"","actor_role":"passenger",'
+    '"keywords":["first class","food","insurance"]}\n'
+    '  "pay using internal account balance" → '
+    '{"step_type":"pay","train_type":"","seat_class":"",'
+    '"services":[],"payment_mode":"internal","search_criteria":[],"order_filter":"","actor_role":"",'
+    '"keywords":["inside"]}\n'
+    '  "pay using external payment service" → '
+    '{"step_type":"pay","train_type":"","seat_class":"",'
+    '"services":[],"payment_mode":"external","search_criteria":[],"order_filter":"","actor_role":"",'
+    '"keywords":["payment","service"]}\n'
+    '  "advanced search: cheapest G-train trips" → '
+    '{"step_type":"search_advanced","train_type":"G","seat_class":"",'
+    '"services":[],"payment_mode":"","search_criteria":["cheapest"],"order_filter":"","actor_role":"",'
+    '"keywords":[]}\n'
+    '  "ask for trips with a transfer via Suzhou" → '
+    '{"step_type":"search_transit","train_type":"","seat_class":"",'
+    '"services":[],"payment_mode":"","search_criteria":["transfer"],"order_filter":"","actor_role":"",'
+    '"keywords":["transfer"]}\n'
+    '  "query G-train orders (status: Paid)" → '
+    '{"step_type":"query_orders","train_type":"G","seat_class":"",'
+    '"services":[],"payment_mode":"","search_criteria":[],"order_filter":"status:Paid","actor_role":"",'
+    '"keywords":[]}\n'
+    "Output ONLY valid JSON. No other text."
 )
 
-_CLASSIFY_NUM_PREDICT = 60  # короче чем handler selection (40), но массив может быть длиннее
+_CLASSIFY_NUM_PREDICT = 200  # полный StepParams JSON ~60-120 токенов
 
 
 # ---------------------------------------------------------------------------
@@ -427,21 +484,21 @@ class QwenEncoder:
     # Pass 1: параллельная классификация шагов (без кандидатов)
     # ------------------------------------------------------------------
 
-    def classify_step(self, action: str) -> QwenClassifyOutput:
-        """Pass 1: определить step_type и search_keywords для одного шага.
+    def classify_step(self, action: str) -> StepParams:
+        """Pass 1: извлечь StepParams из текста шага через Qwen.
 
         Не требует списка кандидатов → можно запускать параллельно до Pass 2.
-        Результат кешируется по тексту шага.
+        Результат кешируется по тексту шага (ключ cls_v2).
         """
-        cache_key = ("cls", action)
+        cache_key = ("cls_v3", action)
         cached = self._cache.get(cache_key)
-        if isinstance(cached, QwenClassifyOutput):
+        if isinstance(cached, StepParams):
             return cached
 
         if not self.enabled:
-            return QwenClassifyOutput()
+            return StepParams()
 
-        prompt = f'Action: "{action}"\n\nJSON: {{"step_type": "...", "search_keywords": [...]}}'
+        prompt = f'Action: "{action}"\n\nJSON:'
         try:
             if self._backend == "ollama":
                 raw = self._call_ollama(
@@ -451,13 +508,12 @@ class QwenEncoder:
                     num_predict=_CLASSIFY_NUM_PREDICT,
                 )
             elif self._backend == "transformers":
-                # transformers: временно использует то же self._system — TODO
                 raw = self._call_transformers(prompt)
             else:
                 raw = {}
-            result = QwenClassifyOutput.from_raw(raw)
+            result = StepParams.from_raw(raw)
         except Exception:
-            result = QwenClassifyOutput()
+            result = StepParams()
 
         with self._cache_lock:
             self._cache[cache_key] = result
@@ -471,7 +527,7 @@ class QwenEncoder:
         self,
         actions: list[str],
         n_workers: int = 4,
-    ) -> list[QwenClassifyOutput]:
+    ) -> list[StepParams]:
         """Pass 1: параллельная классификация всех шагов сценария.
 
         Вызовы независимы (не используют step_history) → ThreadPoolExecutor.
@@ -479,12 +535,12 @@ class QwenEncoder:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        results: list[QwenClassifyOutput] = [QwenClassifyOutput()] * len(actions)
+        results: list[StepParams] = [StepParams()] * len(actions)
         uncached_indices: list[int] = []
 
         for i, action in enumerate(actions):
-            cached = self._cache.get(("cls", action))
-            if isinstance(cached, QwenClassifyOutput):
+            cached = self._cache.get(("cls_v3", action))
+            if isinstance(cached, StepParams):
                 results[i] = cached
             else:
                 uncached_indices.append(i)
