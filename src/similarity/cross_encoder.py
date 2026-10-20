@@ -16,8 +16,40 @@ from __future__ import annotations
 
 import logging
 import math
+import pickle
+from pathlib import Path
 
 _log = logging.getLogger(__name__)
+
+_CE_SCORES_CACHE_FILE = Path(__file__).parents[2] / "cache" / "ce_scores_cache.pkl"
+_CE_SCORES_CACHE: "dict[tuple, list[float]]" = {}
+_CE_CACHE_DIRTY = False
+
+
+def _load_ce_cache() -> None:
+    global _CE_SCORES_CACHE
+    try:
+        if _CE_SCORES_CACHE_FILE.exists():
+            with open(_CE_SCORES_CACHE_FILE, "rb") as f:
+                _CE_SCORES_CACHE = pickle.load(f)
+    except Exception:
+        _CE_SCORES_CACHE = {}
+
+
+def _save_ce_cache() -> None:
+    global _CE_CACHE_DIRTY
+    if not _CE_CACHE_DIRTY:
+        return
+    try:
+        _CE_SCORES_CACHE_FILE.parent.mkdir(exist_ok=True)
+        with open(_CE_SCORES_CACHE_FILE, "wb") as f:
+            pickle.dump(_CE_SCORES_CACHE, f)
+        _CE_CACHE_DIRTY = False
+    except Exception as exc:
+        _log.debug("ce_scores_cache сохранение ошибка: %s", exc)
+
+
+_load_ce_cache()
 
 _CE_MODEL = None
 _CE_TOKENIZER = None
@@ -90,26 +122,35 @@ class CrossEncoder:
 
         try:
             import torch  # type: ignore  # noqa: PLC0415
+            global _CE_CACHE_DIRTY
 
-            queries = [query] * len(top)
-            docs = [doc_texts.get(h, "") for _, h in top]
+            handler_ids = tuple(h for _, h in top)
+            cache_key = (query, handler_ids)
 
-            enc = _CE_TOKENIZER(
-                queries,
-                docs,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )
-            with torch.no_grad():
-                logits = _CE_MODEL(**enc).logits.squeeze(-1)
+            if cache_key in _CE_SCORES_CACHE:
+                ce_scores = _CE_SCORES_CACHE[cache_key]
+            else:
+                queries = [query] * len(top)
+                docs = [doc_texts.get(h, "") for _, h in top]
 
-            # sigmoid: logit → [0, 1]
-            raw = logits.tolist()
-            if isinstance(raw, float):
-                raw = [raw]
-            ce_scores = [1.0 / (1.0 + math.exp(-x)) for x in raw]
+                enc = _CE_TOKENIZER(
+                    queries,
+                    docs,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt",
+                )
+                with torch.no_grad():
+                    logits = _CE_MODEL(**enc).logits.squeeze(-1)
+
+                # sigmoid: logit → [0, 1]
+                raw = logits.tolist()
+                if isinstance(raw, float):
+                    raw = [raw]
+                ce_scores = [1.0 / (1.0 + math.exp(-x)) for x in raw]
+                _CE_SCORES_CACHE[cache_key] = ce_scores
+                _CE_CACHE_DIRTY = True
 
             # Нормировать существующие баллы в [0, 1]
             ex_max = max(sc for sc, _ in top) or 1.0

@@ -26,6 +26,7 @@ from src.localization.ui_context import ui_context, handler_docs  # noqa: E402
 from src.localization.scorer import Scorer                        # noqa: E402
 from src.enrichment.signatures import build_extra_tokens          # noqa: E402
 from src.localization.searcher import enhanced_ground, set_targets_root, set_corpus, init_code_encoders, flush_qwen_cache, batch_classify_steps  # noqa: E402
+from src.similarity.cross_encoder import _save_ce_cache  # noqa: E402
 from src.localization.flow_graph import FlowContext  # noqa: E402
 from src.trace.closure import enhanced_closure, pruned_closure    # noqa: E402
 from src.localization.service_classifier import (                 # noqa: E402
@@ -405,6 +406,7 @@ def main() -> None:
     print(f"сохранено: {a.out}", file=sys.stderr)
 
     flush_qwen_cache()
+    _save_ce_cache()
 
     if a.viz and viz_explain:
         _write_viz(viz_explain, Path(a.viz), Path(a.targets))

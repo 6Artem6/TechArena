@@ -172,6 +172,7 @@ def collect_code_files() -> list[tuple[Path, str]]:
 CACHE_FILES: list[str] = [
     "cache/service_passports.pkl",
     "cache/qwen_encoder_cache.pkl",
+    "cache/ce_scores_cache.pkl",
 ]
 
 

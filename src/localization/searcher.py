@@ -318,6 +318,9 @@ def _init_service_matcher(ix) -> None:
             texts[nid] = (base + " " + " ".join(extra_parts[:40])).strip()
 
         _DOC_TEXTS = texts
+        # Предвычислить BGE-M3 эмбеддинги всех handlers один раз.
+        # rerank() будет брать векторы из кеша вместо encode на каждом шаге.
+        _RERANKER.precompute_doc_vecs(texts)
         print(
             f"[searcher] SemanticReranker готов, doc_texts={len(texts)} обработчиков",
             file=_sys.stderr,

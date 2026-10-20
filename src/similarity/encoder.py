@@ -61,6 +61,30 @@ class SemanticReranker:
     def __init__(self, model_name: str = "BAAI/bge-m3") -> None:
         self._model_name = model_name
         self._model = _try_load_model(model_name)
+        # Предвычисленные doc vectors: {handler_id → ndarray}.
+        # Заполняется через precompute_doc_vecs() один раз при инициализации.
+        self._doc_vecs: "dict[str, object]" = {}
+
+    def precompute_doc_vecs(self, doc_texts: "dict[str, str]") -> None:
+        """Предвычислить эмбеддинги всех handler doc_texts один раз.
+
+        После вызова rerank() берёт векторы из кеша вместо повторного encode.
+        Вызывать один раз после построения doc_texts (в init_enhanced_ground).
+        """
+        if not self.enabled or not doc_texts:
+            return
+        try:
+            ids = list(doc_texts.keys())
+            texts = [doc_texts[h] for h in ids]
+            vecs = self._model.encode(
+                texts,
+                normalize_embeddings=True,
+                batch_size=64,
+                show_progress_bar=False,
+            )
+            self._doc_vecs = dict(zip(ids, vecs))
+        except Exception as exc:
+            _log.debug("precompute_doc_vecs ошибка: %s — кеш не заполнен", exc)
 
     @property
     def enabled(self) -> bool:
@@ -104,19 +128,30 @@ class SemanticReranker:
             # Взять top_k кандидатов для dense-кодирования
             top_cands = candidates[:top_k]
             doc_ids = [h for _, h in top_cands]
-            texts = [doc_texts.get(h, "") for h in doc_ids]
 
-            if not any(texts):
-                return candidates
-
-            # Кодировать запрос и документы
             q_emb = model.encode(query_text, normalize_embeddings=True)
-            d_embs = model.encode(
-                texts,
-                normalize_embeddings=True,
-                batch_size=32,
-                show_progress_bar=False,
-            )
+
+            if self._doc_vecs:
+                # Быстрый путь: берём предвычисленные векторы из кеша
+                import numpy as np  # noqa: F811
+                cached = [self._doc_vecs.get(h) for h in doc_ids]
+                if all(v is not None for v in cached):
+                    d_embs = np.stack(cached)
+                else:
+                    # Часть handlers не в кеше → encode только недостающие
+                    texts = [doc_texts.get(h, "") for h in doc_ids]
+                    d_embs = model.encode(texts, normalize_embeddings=True,
+                                         batch_size=32, show_progress_bar=False)
+            else:
+                texts = [doc_texts.get(h, "") for h in doc_ids]
+                if not any(texts):
+                    return candidates
+                d_embs = model.encode(
+                    texts,
+                    normalize_embeddings=True,
+                    batch_size=32,
+                    show_progress_bar=False,
+                )
 
             # Cosine similarity (нормализованные векторы → dot product)
             dense_scores: list[float] = (d_embs @ q_emb).tolist()
