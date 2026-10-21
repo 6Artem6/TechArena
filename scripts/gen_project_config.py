@@ -86,27 +86,56 @@ def derive_func_variant_suffixes(modules: list[str], prefix: str, suffix: str) -
 # Шаг 3: optional_service_groups — кластеризация через теги паспортов
 # ---------------------------------------------------------------------------
 
-# Стоп-токены: слишком общие, не являются feature-специфичными
-_TAG_STOP = frozenset({
+# NLP-базис стоп-токенов: слова слишком общие для любого проекта.
+# Доменные стоп-токены (train, order, booking и т.д.) вычисляются
+# динамически через derive_high_freq_tokens() — они специфичны для проекта.
+_TAG_STOP_BASE = frozenset({
     "management", "retrieval", "service", "system", "operations", "data",
     "admin", "information", "handling", "specific", "creation", "deletion",
-    "update", "access", "train", "order", "booking", "route", "station",
-    "travel", "payment", "user", "ticket", "price", "seat", "cancel",
-    "rebook", "basic", "auth", "security", "common", "notify", "send",
-    "contact", "request", "lookup", "search", "query", "based", "list",
-    "name", "type", "details", "config", "processing", "other", "inside",
+    "update", "access", "processing", "other", "inside", "based",
     "record", "retrieve", "insert", "create", "delete", "batch",
-    "unique", "identifier", "existing", "available", "specific",
+    "unique", "identifier", "existing", "available", "list",
+    "name", "type", "details", "config", "request", "lookup", "search", "query",
+    "send", "notify", "contact",
 })
 
-# Core первые-токены в именах сервисов → не передавать в Qwen как optional кандидаты
-# Проверяется только ПЕРВЫЙ токен нормализованного имени (prefix/suffix сняты)
-_CORE_NAME_TOKENS = frozenset({
-    "order", "travel", "route", "seat", "user", "auth", "security", "basic",
-    "admin", "payment", "cancel", "execute", "rebook", "notify", "station",
-    "train", "gateway", "config", "common", "wait", "inside", "preserve",
-    "contacts", "delivery", "notification", "verification",
+# Инфраструктурные токены — не optional-addon по определению.
+# Проверяется только ПЕРВЫЙ токен нормализованного имени (prefix/suffix сняты).
+# Доменные core-токены (order, travel, station и т.д.) вычисляются динамически
+# через derive_core_name_tokens() — они встречаются у >1 сервиса и специфичны для проекта.
+_CORE_INFRA_TOKENS = frozenset({
+    "auth", "security", "gateway", "common", "wait", "inside",
+    "admin", "execute", "delivery", "notification", "verification",
 })
+
+
+def derive_high_freq_tokens(
+    svc_tokens: dict[str, set[str]], n_modules: int, threshold: float = 0.40
+) -> frozenset[str]:
+    """Токены встречающиеся у >= threshold доли сервисов → слишком generic → стоп."""
+    tok_count: Counter[str] = Counter()
+    for tokens in svc_tokens.values():
+        for tok in tokens:
+            tok_count[tok] += 1
+    min_count = max(2, int(n_modules * threshold))
+    return frozenset(tok for tok, cnt in tok_count.items() if cnt >= min_count)
+
+
+def derive_core_name_tokens(
+    modules: list[str], prefix: str, suffix: str
+) -> frozenset[str]:
+    """Первые токены нормализованных имён сервисов, встречающиеся у >1 модуля.
+
+    Эти токены являются core-сервисами проекта (order, travel, station, …),
+    а не optional addon feature groups.
+    """
+    first_tok_count: Counter[str] = Counter()
+    for mod in modules:
+        norm = mod.removeprefix(prefix).removesuffix(suffix)
+        first = norm.split("-")[0]
+        if len(first) >= 4:
+            first_tok_count[first] += 1
+    return frozenset(tok for tok, cnt in first_tok_count.items() if cnt > 1)
 
 # Сохраняется в project_config.json, используется в шаге 6 (optional_patterns.json)
 # Формат: {group_name: [synonym_tokens_for_regex]}
@@ -143,7 +172,7 @@ def _load_svc_tag_tokens(
 
 
 def _cluster_by_token_overlap(
-    svc_tokens: dict[str, set[str]], n_modules: int
+    svc_tokens: dict[str, set[str]], n_modules: int, stop_tokens: frozenset[str]
 ) -> dict[str, list[str]]:
     """Детерминированная кластеризация: token → [services] при 2 ≤ count ≤ n//6."""
     tok_svcs: dict[str, list[str]] = {}
@@ -154,7 +183,7 @@ def _cluster_by_token_overlap(
     return {
         tok: sorted(set(svcs))
         for tok, svcs in tok_svcs.items()
-        if 2 <= len(svcs) <= max_count and tok not in _TAG_STOP
+        if 2 <= len(svcs) <= max_count and tok not in stop_tokens
     }
 
 
@@ -171,7 +200,14 @@ def derive_optional_groups_from_tags(
         tokens_per_grp — {group_name: [synonym_tokens]} для шага 6 (optional_patterns.json)
     """
     svc_tokens = _load_svc_tag_tokens(modules, prefix, suffix)
-    cluster_cands = _cluster_by_token_overlap(svc_tokens, len(modules))
+
+    # Динамические стоп-токены: NLP-базис + высококорреляционные domain-токены + core инфра.
+    # Не хардкодим доменные токены (train/order/station/…) — вычисляем из скелета.
+    core_name_toks = derive_core_name_tokens(modules, prefix, suffix)
+    high_freq = derive_high_freq_tokens(svc_tokens, len(modules), threshold=0.40)
+    stop_tokens: frozenset[str] = _TAG_STOP_BASE | high_freq | _CORE_INFRA_TOKENS | core_name_toks
+
+    cluster_cands = _cluster_by_token_overlap(svc_tokens, len(modules), stop_tokens)
 
     if no_qwen:
         # Без Qwen: вернуть кандидаты как есть (возможны ложные группы)
@@ -217,12 +253,14 @@ def derive_optional_groups_from_tags(
     clustered = {s for svcs in groups.values() for s in svcs}
 
     # Qwen шаг 2: singletons батчами по 12 — classify unclustered services
-    # Отсеять core-сервисы по name-токенам перед передачей в Qwen
+    # Отсеять core-сервисы по динамически вычисленным core-токенам.
+    all_core_toks = core_name_toks | _CORE_INFRA_TOKENS
+
     def _is_core(mod: str) -> bool:
         norm = mod.removeprefix(prefix).removesuffix(suffix)
         first = norm.split("-")[0]
         # "travel2".startswith("travel") → core; "consign-price" → first="consign" → not core
-        return any(first == tok or first.startswith(tok) for tok in _CORE_NAME_TOKENS)
+        return any(first == tok or first.startswith(tok) for tok in all_core_toks)
 
     singletons = [m for m in sorted(modules) if m not in clustered and not _is_core(m)]
     batch_size = 12
@@ -268,7 +306,7 @@ def derive_optional_groups_from_tags(
         for s in member_tok_sets[1:]:
             shared &= s
         shared.add(grp)  # group_name всегда в expand-ключах
-        shared -= _TAG_STOP
+        shared -= stop_tokens
         if not shared:
             continue
         for m in modules:
@@ -289,7 +327,7 @@ def derive_optional_groups_from_tags(
         member_toks = []
         for svc in svcs:
             norm = svc.removeprefix(prefix).removesuffix(suffix)
-            member_toks.append({p for p in norm.split("-") if len(p) >= 4 and p not in _TAG_STOP})
+            member_toks.append({p for p in norm.split("-") if len(p) >= 4 and p not in stop_tokens})
         if member_toks:
             shared = member_toks[0].copy()
             for s in member_toks[1:]:
@@ -586,28 +624,77 @@ def main() -> None:
     print(json.dumps(config, ensure_ascii=False, indent=2))
 
     # Шаг 6: optional_patterns.json — regex для has_*/no_* ключей (step_typer.py)
+    # Требует Qwen для корректной фильтрации optional groups.
+    # При --no-qwen группы содержат мусор → шаг пропускается, кеш не перезаписывается.
+    if args.no_qwen:
+        print("Шаг 6 пропущен (--no-qwen): optional_patterns.json не перезаписан", file=sys.stderr)
+        return
+
     # Источник токенов: opt_tokens_per_grp (из тегов паспортов + имён сервисов).
     # step_typer.py ожидает ключи: has_food, no_food, has_insurance, no_insurance,
     #   has_luggage, no_luggage (старый API: consign → luggage).
-    # Маппинг group_name → pattern_key определяется по overlap токенов.
-    _KNOWN_PATTERN_KEYS = {
+    # Маппинг group_name → pattern_key: базис hardcoded (известные домены),
+    # незнакомые группы разрешает Qwen.
+    _BASE_PATTERN_KEYS: dict[str, str] = {
         "food": "food", "meal": "food", "dining": "food",
         "insurance": "insurance", "assurance": "insurance", "coverage": "insurance",
         "consign": "luggage", "consignment": "luggage", "luggage": "luggage", "baggage": "luggage",
     }
+    # Определить какие группы не покрыты базисом → передать в Qwen
+    unknown_groups: list[str] = []
+    for grp, tokens in opt_tokens_per_grp.items():
+        pat_key = _BASE_PATTERN_KEYS.get(grp)
+        if pat_key is None:
+            pat_key = next((
+                _BASE_PATTERN_KEYS[tok] for tok in tokens if tok in _BASE_PATTERN_KEYS
+            ), None)
+        if pat_key is None:
+            unknown_groups.append(grp)
+
+    # Qwen шаг 7: для незнакомых групп определить тип optional addon
+    qwen_pattern_keys: dict[str, str] = {}
+    if unknown_groups and not args.no_qwen:
+        try:
+            from src.localization.qwen_encoder import QwenEncoder
+            enc7 = QwenEncoder()
+            if enc7.enabled:
+                known_keys = sorted({v for v in _BASE_PATTERN_KEYS.values()})
+                grp_desc = "\n".join(
+                    f"  {g}: services={opt_groups.get(g, [])}, tokens={opt_tokens_per_grp[g]}"
+                    for g in unknown_groups
+                )
+                obj_schema2: dict = {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                }
+                prompt7 = (
+                    f"Optional service groups with unknown pattern key:\n{grp_desc}\n\n"
+                    f"Known optional addon types: {known_keys}\n"
+                    f"Map each group to the closest known type (food/insurance/luggage), "
+                    f"or assign a new short snake_case key if it's a different addon type.\n"
+                    f"Return ONLY JSON: {{\"group_name\": \"pattern_key\", ...}}"
+                )
+                raw7 = enc7._call_ollama(prompt7, schema=obj_schema2, num_predict=100, timeout=30)
+                if isinstance(raw7, dict):
+                    for g, k in raw7.items():
+                        if g in unknown_groups and isinstance(k, str) and k:
+                            qwen_pattern_keys[g] = k
+                            print(f"  Qwen pattern_key: {g} → {k}", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] Qwen ошибка step7 (pattern_keys): {e}", file=sys.stderr)
+
     patterns: dict[str, str] = {}
     for grp, tokens in opt_tokens_per_grp.items():
-        # Определить pattern_key: первый токен группы совпадающий с известным маппингом
-        pat_key = _KNOWN_PATTERN_KEYS.get(grp)
+        # Определить pattern_key: базисный маппинг → Qwen → group_name as-is
+        pat_key = _BASE_PATTERN_KEYS.get(grp)
         if pat_key is None:
-            for tok in tokens:
-                if tok in _KNOWN_PATTERN_KEYS:
-                    pat_key = _KNOWN_PATTERN_KEYS[tok]
-                    break
+            pat_key = next((
+                _BASE_PATTERN_KEYS[tok] for tok in tokens if tok in _BASE_PATTERN_KEYS
+            ), None)
         if pat_key is None:
-            pat_key = grp  # fallback: group_name as-is
+            pat_key = qwen_pattern_keys.get(grp, grp)  # Qwen или fallback: group_name as-is
         # Добавить все синонимы pat_key из маппинга (luggage/baggage для consign)
-        synonyms = {t for t, k in _KNOWN_PATTERN_KEYS.items() if k == pat_key and len(t) >= 4}
+        synonyms = {t for t, k in _BASE_PATTERN_KEYS.items() if k == pat_key and len(t) >= 4}
         all_toks = sorted(set(tokens) | synonyms)
         tok_pat = "|".join(t for t in all_toks if len(t) >= 4)
         if not tok_pat:
