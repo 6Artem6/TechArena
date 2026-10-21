@@ -44,41 +44,13 @@ excluded_dirs:
 # Token Taxonomy — классификация токенов имён сервисов (service_classifier.py)
 # ---------------------------------------------------------------------------
 
-# Tier 2: архитектурные роли — фильтруются при авто-извлечении Tier 3 (P-93)
-# Tier 3 (доменные) авто-извлекается из имён сервисов скелета: не хардкодится.
-tier2_arch_tokens:
-  - service        # суффикс, остаётся если не полностью убрался _svc_strip
-  - controller
-  - dto
-  - repository
-  - impl
-  - api
-  - server
-  - client
-  - handler
-  - manager
-  - factory
-  - helper
-  - util
-  - utils
+# tier2_arch_tokens убраны:
+#   генерируются из скелета через scripts/gen_project_config.py → cache/project_config.json
+#   (whitelist архитектурных ролей ∩ реальные classnames проекта + Qwen-расширение)
 
-# Tier 4 Remote: инфра-токены для фильтра remote edges (широкий набор)
-tier4_remote_tokens:
-  - auth
-  - authentication
-  - authorize
-  - authorization
-  - verify
-  - verification
-  - jwt
-  - token
-  - credential
-  - password
-  - secret
-  - captcha
-  - user
-  - account
-  # "security" намеренно исключён: ts-security-service — конфигурационный сервис
+# tier4_remote_tokens убраны:
+#   генерируются из скелета через scripts/gen_project_config.py → cache/project_config.json
+#   (known auth/security whitelist ∩ реальные tokens скелета + Qwen-расширение)
 
 # Tier 4 Executes: строгий набор только для фильтра executes
 tier4_executes_tokens:

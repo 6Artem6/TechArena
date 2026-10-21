@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Генерация cache/project_config.json из скелета и Qwen.
 
-Выводит три блока, которые затем убираются из domain_config.yaml:
-  - service_naming      (prefix/suffix из commonprefix имён сервисов)
+Выводит блоки, которые затем убираются из domain_config.yaml:
+  - service_naming        (prefix/suffix из commonprefix имён сервисов)
   - func_variant_suffixes (diff нормализованных пар имён сервисов)
   - optional_service_groups (Qwen: группировка сервисов по опциональным фичам)
+  - tier2_arch_tokens     (Qwen: архитектурные роли из частых токенов имён классов)
+  - tier4_remote_tokens   (Qwen: инфра-токены аутентификации для языка проекта)
 
 _config.py при загрузке YAML merges поверх него содержимое project_config.json,
 поэтому изменения в YAML не нужны — достаточно запустить этот скрипт.
@@ -20,7 +22,9 @@ import argparse
 import gzip
 import json
 import os
+import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -180,10 +184,196 @@ def derive_optional_groups_qwen(modules: list[str]) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Шаг 4: tier2_arch_tokens — Qwen валидирует архитектурные токены
+# ---------------------------------------------------------------------------
+
+def _tokenize_camel(name: str) -> list[str]:
+    # Убрать анонимные классы Java: "Impl$1" → пропустить весь токен
+    if "$" in name:
+        return []
+    parts = re.sub(r"([A-Z])", r"_\1", name).replace("-", "_").split("_")
+    return [t.lower() for t in parts if len(t) > 2 and "$" not in t]
+
+
+def _extract_class_tokens(sk: dict, top_n: int = 80) -> list[str]:
+    counts: Counter[str] = Counter()
+    for node in sk["nodes"].values():
+        if node.get("kind") != "type":
+            continue
+        # fqn = "pkg.ClassName" — берём только имя класса (после последней точки)
+        fqn = node.get("fqn", "")
+        class_name = fqn.rsplit(".", 1)[-1] if "." in fqn else fqn
+        for tok in _tokenize_camel(class_name):
+            counts[tok] += 1
+    return [tok for tok, _ in counts.most_common(top_n)]
+
+
+def _extract_method_tokens(sk: dict, top_n: int = 60, namespace_filter: str = "") -> list[str]:
+    counts: Counter[str] = Counter()
+    for nid, node in sk["nodes"].items():
+        if node.get("kind") != "method":
+            continue
+        if namespace_filter and namespace_filter not in nid.lower():
+            continue
+        name = node.get("name", "")
+        if "<" in name:  # пропустить <init>, <clinit>
+            continue
+        for tok in _tokenize_camel(name):
+            counts[tok] += 1
+    return [tok for tok, _ in counts.most_common(top_n)]
+
+
+def _extract_domain_tokens(modules: list[str], prefix: str, suffix: str) -> set[str]:
+    tokens: set[str] = set()
+    for m in modules:
+        tokens.update(m.removeprefix(prefix).removesuffix(suffix).split("-"))
+    return tokens
+
+
+def _detect_project_language(sk: dict) -> str:
+    counts: Counter[str] = Counter()
+    for node in sk["nodes"].values():
+        fp = node.get("file", "")
+        if not fp:
+            continue
+        if fp.endswith(".java"):
+            counts["java"] += 1
+        elif fp.endswith(".go"):
+            counts["go"] += 1
+        elif fp.endswith(".py"):
+            counts["python"] += 1
+        elif fp.endswith((".ts", ".tsx")):
+            counts["typescript"] += 1
+    if not counts:
+        kinds = Counter(n.get("kind", "") for n in sk["nodes"].values())
+        if kinds.get("type", 0) > 50:
+            return "java"
+        return "unknown"
+    return counts.most_common(1)[0][0]
+
+
+# Известные архитектурные токены — детерминированный базис для tier2
+_ARCH_TOKEN_WHITELIST = frozenset({
+    "controller", "service", "impl", "repository", "handler", "manager",
+    "factory", "client", "server", "dto", "dao", "mapper", "provider",
+    "util", "utils", "listener", "adapter", "interceptor", "proxy",
+    "validator", "builder", "registry", "config",
+})
+
+
+def derive_tier2_arch_tokens(sk: dict, domain_tokens: set[str], no_qwen: bool) -> list[str]:
+    # Все токены из имён классов скелета
+    all_class_tokens = set(_extract_class_tokens(sk, top_n=300))
+    # Детерминированный базис: whitelist ∩ скелет, без доменных токенов
+    base = sorted(_ARCH_TOKEN_WHITELIST & all_class_tokens - domain_tokens)
+
+    if no_qwen:
+        return base
+
+    # Кандидаты для Qwen-расширения: частые токены вне whitelist и не доменные
+    extra_cands = [
+        t for t in _extract_class_tokens(sk, top_n=80)
+        if t not in _ARCH_TOKEN_WHITELIST and t not in domain_tokens
+    ][:20]
+
+    if not extra_cands:
+        return base
+
+    from src.localization.qwen_encoder import QwenEncoder
+    enc = QwenEncoder()
+    if not enc.enabled:
+        print("[WARN] Qwen недоступен — tier2_arch_tokens: только детерминированный базис", file=sys.stderr)
+        return base
+
+    schema: dict = {"type": "array", "items": {"type": "string"}}
+    prompt = (
+        f"Java Spring Boot class name tokens — classify as architectural role or not:\n"
+        f"{', '.join(extra_cands)}\n\n"
+        f"TASK: Select tokens that name an ARCHITECTURAL COMPONENT ROLE.\n"
+        f"INCLUDE: handler, manager, factory, client, server, dao, mapper, provider,\n"
+        f"  listener, adapter, interceptor, proxy, validator, builder, registry\n"
+        f"EXCLUDE: business domain terms, data/status words (result, data, list, type,\n"
+        f"  status, record), verbs (get, add, send), app bootstraps (application, init),\n"
+        f"  messaging (rabbit, queues), any framework-specific words\n\n"
+        f"Return ONLY a JSON array of architectural role tokens from the input list."
+    )
+    try:
+        raw = enc._call_ollama(prompt, schema=schema, num_predict=150, timeout=30)
+        if isinstance(raw, list):
+            qwen_extra = [t for t in raw if t in set(extra_cands)]
+            return sorted(set(base) | set(qwen_extra))
+    except Exception as e:
+        print(f"[WARN] Qwen ошибка tier2: {e}", file=sys.stderr)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Шаг 5: tier4_remote_tokens — Qwen генерирует инфра-токены для языка
+# ---------------------------------------------------------------------------
+
+# Известные auth/security инфра-токены — детерминированный базис для tier4
+_AUTH_TOKEN_WHITELIST = frozenset({
+    "auth", "authentication", "authorize", "authorization",
+    "verify", "verification", "jwt", "token", "credential",
+    "password", "secret", "captcha", "encoder", "username",
+})
+
+
+def derive_tier4_remote_tokens(sk: dict, language: str, no_qwen: bool) -> list[str]:
+    # Все токены из имён классов и методов скелета
+    all_class = set(_extract_class_tokens(sk, top_n=500))
+    all_method = set(_extract_method_tokens(sk, top_n=500))
+    all_tokens = all_class | all_method
+    # Детерминированный базис: known auth whitelist ∩ реальные токены скелета
+    base = sorted(_AUTH_TOKEN_WHITELIST & all_tokens)
+
+    if no_qwen:
+        return base or sorted(_AUTH_TOKEN_WHITELIST)
+
+    # Кандидаты для Qwen-расширения: security/auth namespace токены вне whitelist
+    sec = _extract_method_tokens(sk, top_n=60, namespace_filter="security")
+    auth = _extract_method_tokens(sk, top_n=60, namespace_filter="auth")
+    _exclude = {"cors", "configure", "mapping", "configurer", "get", "add",
+                "find", "create", "delete", "all", "non", "default"}
+    extra_cands = [
+        t for t in sec + auth
+        if t not in _AUTH_TOKEN_WHITELIST and t not in _exclude
+    ][:15]
+
+    if not extra_cands:
+        return base
+
+    from src.localization.qwen_encoder import QwenEncoder
+    enc = QwenEncoder()
+    if not enc.enabled:
+        print("[WARN] Qwen недоступен — tier4_remote_tokens: только детерминированный базис", file=sys.stderr)
+        return base
+
+    schema: dict = {"type": "array", "items": {"type": "string"}}
+    prompt = (
+        f"Candidate tokens from {language} security/auth class and method names:\n"
+        f"{', '.join(extra_cands)}\n\n"
+        f"TASK: Which tokens relate to USER AUTHENTICATION or CREDENTIAL HANDLING?\n"
+        f"INCLUDE: tokens like 'expir', 'refresh', 'claim', 'bearer', 'otp', 'role', 'principal'\n"
+        f"EXCLUDE: general HTTP (cors, mapping), config terms (configure, configurer),\n"
+        f"  common verbs (check, send, build), architectural roles (service, controller)\n\n"
+        f"Return ONLY a JSON array of auth/credential tokens from the input list."
+    )
+    try:
+        raw = enc._call_ollama(prompt, schema=schema, num_predict=150, timeout=30)
+        if isinstance(raw, list):
+            qwen_extra = [t for t in raw if t in set(extra_cands)]
+            return sorted(set(base) | set(qwen_extra))
+    except Exception as e:
+        print(f"[WARN] Qwen ошибка tier4: {e}", file=sys.stderr)
+    return base
+
+
+# ---------------------------------------------------------------------------
 # Загрузка скелета
 # ---------------------------------------------------------------------------
 
-def load_modules(skeleton_path: Path) -> list[str]:
+def load_skeleton(skeleton_path: Path) -> tuple[dict, list[str]]:
     with gzip.open(skeleton_path) as f:
         sk = json.load(f)
     modules = sorted({
@@ -191,7 +381,7 @@ def load_modules(skeleton_path: Path) -> list[str]:
         for n in sk["nodes"].values()
         if n.get("module", "")
     })
-    return modules
+    return sk, modules
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +400,7 @@ def main() -> None:
         sys.exit(f"Скелет не найден: {skeleton_path}")
 
     print(f"Загружаю скелет: {skeleton_path.name}", file=sys.stderr)
-    modules = load_modules(skeleton_path)
+    sk, modules = load_skeleton(skeleton_path)
     print(f"Модулей: {len(modules)}", file=sys.stderr)
 
     # Шаг 1: service_naming
@@ -234,6 +424,28 @@ def main() -> None:
         else:
             print("  Qwen не вернул групп", file=sys.stderr)
 
+    # Шаг 4: tier2_arch_tokens
+    domain_tokens = _extract_domain_tokens(modules, naming["prefix"], naming["suffix"])
+    language = _detect_project_language(sk)
+    print(f"Язык проекта: {language}", file=sys.stderr)
+
+    if args.no_qwen:
+        arch_tokens: list[str] = derive_tier2_arch_tokens(sk, domain_tokens, no_qwen=True)
+        print("tier2_arch_tokens: детерминированный fallback (--no-qwen)", file=sys.stderr)
+    else:
+        print("Запрашиваю Qwen для tier2_arch_tokens...", file=sys.stderr)
+        arch_tokens = derive_tier2_arch_tokens(sk, domain_tokens, no_qwen=False)
+    print(f"tier2_arch_tokens: {arch_tokens}", file=sys.stderr)
+
+    # Шаг 5: tier4_remote_tokens
+    if args.no_qwen:
+        remote_tokens: list[str] = derive_tier4_remote_tokens(sk, language, no_qwen=True)
+        print("tier4_remote_tokens: детерминированный fallback (--no-qwen)", file=sys.stderr)
+    else:
+        print("Запрашиваю Qwen для tier4_remote_tokens...", file=sys.stderr)
+        remote_tokens = derive_tier4_remote_tokens(sk, language, no_qwen=False)
+    print(f"tier4_remote_tokens: {remote_tokens}", file=sys.stderr)
+
     # Сборка результата
     config: dict = {
         "service_naming": naming,
@@ -246,6 +458,10 @@ def main() -> None:
         for key, svcs in sorted(opt_groups.items()):
             print(f"  {key}: {svcs}", file=sys.stderr)
         config["optional_service_groups"] = opt_groups
+    if arch_tokens:
+        config["tier2_arch_tokens"] = arch_tokens
+    if remote_tokens:
+        config["tier4_remote_tokens"] = remote_tokens
 
     # Сохранение
     from src._config import cfg_cache_dir
@@ -254,6 +470,26 @@ def main() -> None:
     out_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nСохранено: {out_path}", file=sys.stderr)
     print(json.dumps(config, ensure_ascii=False, indent=2))
+
+    # Шаг 6: optional_patterns.json — regex для has_*/no_* ключей (step_typer.py)
+    # Детерминированно из _FEATURE_TOKENS; no_* = "without|no" + те же токены
+    # consign → luggage: step_typer ожидает ключ "luggage"
+    _FEATURE_TO_PATTERN_KEY: dict[str, str] = {
+        "food": "food", "insurance": "insurance", "consign": "luggage",
+    }
+    _FEATURE_TOKENS_EXT: dict[str, list[str]] = {
+        **_FEATURE_TOKENS,
+        "consign": sorted(set(_FEATURE_TOKENS["consign"]) | {"luggage"}),
+    }
+    patterns: dict[str, str] = {}
+    for feature, tokens in _FEATURE_TOKENS_EXT.items():
+        key = _FEATURE_TO_PATTERN_KEY.get(feature, feature)
+        tok_pat = "|".join(tokens)
+        patterns[f"has_{key}"] = tok_pat
+        patterns[f"no_{key}"] = rf"(?:without|no)\s*(?:{tok_pat})"
+    opt_patterns_path = cfg_cache_dir() / "optional_patterns.json"
+    opt_patterns_path.write_text(json.dumps(patterns, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Сохранено: {opt_patterns_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
