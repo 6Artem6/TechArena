@@ -132,7 +132,7 @@ def _heuristic_g_side(a: str, b: str, reason: str) -> str:
         return "A" if not a_s.endswith("-other") else "B"
     if reason.startswith("numeric_variant"):
         return "A" if not (a_s and a_s[-1].isdigit()) else "B"
-    # trigram: более короткое имя — G-сторона
+    # trigram / levenshtein / substring: более короткое нормализованное имя — G-сторона
     return "A" if len(a_s) <= len(b_s) else "B"
 
 
@@ -212,10 +212,11 @@ def _qwen_classify_func(
 
 def _pair_type(reason: str) -> str:
     """Тип пары сиблингов по структурному признаку отношения."""
-    if reason.startswith(("other_variant", "numeric_variant", "trigram")):
+    if reason.startswith(("other_variant", "numeric_variant", "trigram", "levenshtein")):
         return "primary_variant"
     if reason == "admin_variant":
         return "admin_variant"
+    # substring_variant и func_variant — функциональные пары
     return "func_variant"
 
 

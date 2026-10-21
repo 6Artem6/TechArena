@@ -11,14 +11,15 @@
     ix.submission  → src/output/submission.py       (Phase 3: precision control)
 """
 import json
+import os
 import sys
 import argparse
 from pathlib import Path
 
 _HERE    = Path(__file__).parent
 _ROOT    = _HERE.parent
-SKELETON = _ROOT / "tt-challenge" / "skeleton" / "trainticket.json.gz"
-TARGETS  = _ROOT / "tt-challenge" / "targets" / "trainticket"
+SKELETON = Path(os.getenv("TT_SKELETON", str(_ROOT / "tt-challenge" / "skeleton" / "trainticket.json.gz")))
+TARGETS  = Path(os.getenv("TT_TARGETS",  str(_ROOT / "tt-challenge" / "targets" / "trainticket")))
 
 sys.path.insert(0, str(_ROOT))
 from src.core.skeleton_index import Index, load_json              # noqa: E402
@@ -172,11 +173,20 @@ def predict_scenario(
             "ts-train-food-service", "ts-station-food-service",
         })
         _INS_MODS = frozenset({"ts-assurance-service"})
+        _CONSIGN_MODS = frozenset({"ts-consign-service"})
+        _CONSIGN_STEP_TYPES = {"add_consign", "update_consign", "query_consign"}
         excluded_modules: frozenset[str] = frozenset()
         if not oracle.has_food:
             excluded_modules = excluded_modules | _FOOD_MODS
         if not oracle.has_insurance:
             excluded_modules = excluded_modules | _INS_MODS
+        # Consign: exclude если нет explicit luggage и нет consign-шагов в истории.
+        # preserve-service BFS → createConsign только при actual luggage booking.
+        _has_consign = oracle.has_luggage or any(
+            sr.step_type in _CONSIGN_STEP_TYPES for sr in oracle.step_history
+        )
+        if not _has_consign:
+            excluded_modules = excluded_modules | _CONSIGN_MODS
 
         # search_transit: entry-handler-ы этих шагов вызывают ОБА сиблинг-сервиса
         # (transfer search запрашивает все типы поездов), поэтому для них
@@ -210,6 +220,13 @@ def predict_scenario(
         step_log = None
 
     remote = _filter_remote(remote, no_remote)
+
+    # Post-filter: zero-calls HTTP handlers = welcome/root endpoints (no business logic).
+    # Топологически: @RequestMapping handler без вызовов → не участвует в trace.
+    _zero_calls = {nid for nid, _, _ in _index.handlers if not _index.calls.get(nid)}
+    methods = methods - _zero_calls
+    edges = {(s, t) for s, t in edges if s not in _zero_calls and t not in _zero_calls}
+    remote = {(s, t) for s, t in remote if t not in _zero_calls}
 
     print(
         f"{sid}: входов {len(entries)}, методов {len(methods)}, "
@@ -327,8 +344,14 @@ def _write_viz(viz_explain: dict, viz_path: Path, targets: Path) -> None:
                 svc_nodes.add(src_mod)
                 svc_nodes.add(tgt_mod)
 
+    _sorted_svcs = sorted(svc_nodes)
+    if len(_sorted_svcs) > 1:
+        _pfx = os.path.commonprefix(_sorted_svcs)
+        _sfx = os.path.commonprefix([s[::-1] for s in _sorted_svcs])[::-1]
+    else:
+        _pfx = _sfx = ""
     graph = {
-        "nodes": [{"id": s, "label": s.replace("ts-", "").replace("-service", "")} for s in sorted(svc_nodes)],
+        "nodes": [{"id": s, "label": s.removeprefix(_pfx).removesuffix(_sfx)} for s in _sorted_svcs],
         "links": svc_links,
     }
 

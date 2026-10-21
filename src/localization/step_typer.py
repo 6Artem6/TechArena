@@ -268,9 +268,24 @@ def _build_extra_tokens(
     # add_consign: "insert" extra → insertConsign score > updateConsign.
     if info.step_type == "add_consign":
         tokens.extend(["consign", "consign", "insert"])
-    # query_consign: только "consign" — нет специфики кроме запроса записей.
+    # query_consign: "account" в action → findByAccountId; иначе — общий consign query.
     if info.step_type == "query_consign":
         tokens.extend(["consign", "consign"])
+        if "account" in action.lower():
+            tokens.append("account")
+
+    # get_contact: "account"×2 → findContactsByAccountId wins over getContactsByContactsId.
+    # Contacts lookup in booking flow is always by account ID, not by contacts ID.
+    if info.step_type == "get_contact":
+        tokens.extend(["account", "account"])
+
+    # enter_station: "execute"×2 → executeTicket (URL has "execute" twice) wins over preserve/book handlers.
+    if info.step_type == "enter_station":
+        tokens.extend(["execute", "execute"])
+
+    # collect: "collect"×2 → collectTicket wins over executeTicket.
+    if info.step_type == "collect":
+        tokens.extend(["collect", "collect"])
 
     # query_orders: "refresh/filter/view" → tokens ["query", "order", "orders"] →
     # усиливает queryOrders, getAllOrders в order-service (1 overlap → 3 overlap).

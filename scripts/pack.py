@@ -78,12 +78,21 @@ USED_FILES: list[str] = [
     "src/trace/closure.py",
     "src/trace/oracle.py",
 
+    # Enrichment: AST patch — дописать call-рёбра из тел методов
+    "src/enrichment/ast_calls.py",
+
+    # Localization: service profiles (lazy-load из cache/service_profiles_v1.pkl)
+    "src/localization/service_profiles.py",
+
     # Доменный конфиг и загрузчик (переносимые константы)
     "src/domain_config.yaml",
     "src/_config.py",
 
     # Конфиг проекта
     "pyproject.toml",
+
+    # Документация
+    "README.md",
 ]
 
 # ---------------------------------------------------------------------------
@@ -177,6 +186,8 @@ CACHE_FILES: list[str] = [
     "cache/qwen_encoder_cache.pkl",
     "cache/ce_scores_cache.pkl",
     "cache/fsm_transitions.json",
+    "cache/sibling_metadata.json",
+    "cache/service_profiles_v1.pkl",
 ]
 
 

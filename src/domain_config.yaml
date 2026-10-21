@@ -389,3 +389,6 @@ step_rules:
 
 # action_vocabulary удалён: семантический мост NL → code обеспечивается
 # dense-векторами (SemanticReranker / BGE-M3) в src/similarity/encoder.py.
+
+# Дублировать URL path в doc_text base (усиливает TF URL-сегментов в BM25)
+duplicate_url_path: false

@@ -19,6 +19,7 @@ _HERE = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_HERE))
 
 from src.core.nlp import expand, query_toks, ADMIN, toks  # noqa: E402
+from src._config import cfg_get  # noqa: E402
 from src.localization.step_typer import classify  # noqa: E402
 from src.localization.service_matcher import ServiceMatcher  # noqa: E402
 from src.graph.siblings import _strip  # noqa: E402
@@ -277,9 +278,10 @@ def _init_service_matcher(ix) -> None:
             class_simple = owner_fqn.split(".")[-1] if owner_fqn else ""
             module = ix.module.get(nid, "")
             path = "/" + "/".join(tpl) if tpl else ""
+            _dup_path = path if (path and cfg_get("duplicate_url_path", False)) else ""
 
             # Структурная база: HTTP verb + URL + метод + класс + модуль
-            base = f"{verb} {path} {name} {class_simple} {module}".strip()
+            base = f"{verb} {path} {_dup_path} {name} {class_simple} {module}".strip()
 
             # Обогащение: только domain-специфичные токены из code_doc (TF-IDF фильтрация)
             extra_parts: list[str] = []

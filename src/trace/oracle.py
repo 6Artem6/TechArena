@@ -60,11 +60,13 @@ _TRAIN_NOT_G = _build_not_g_re()
 
 _SEAT_1ST = re.compile(r"\b(first.?class|business.?class|1st.?class)\b", re.I)
 _SEAT_2ND = re.compile(r"\b(second.?class|economy|2nd.?class|standard)\b", re.I)
-_HAS_FOOD = re.compile(r"\b(with\s+food|order\s+food|food\s+service)\b", re.I)
+_HAS_FOOD = re.compile(
+    r"\b(with\s+food|order\s+food|food\s+service|station\s+food|food\s+from\s+a\s+station)\b", re.I)
 _NO_FOOD  = re.compile(r"\b(no\s+food|without\s+food)\b", re.I)
 _HAS_INS  = re.compile(r"\bwith\b.{0,80}\b(assurance|insurance)\b", re.I)
 _NO_INS   = re.compile(r"\b(without|no)\b.{0,80}\b(assurance|insurance)\b", re.I)
-_HAS_LUG  = re.compile(r"\b(with\s+luggage|luggage\s+service)\b", re.I)
+_HAS_LUG  = re.compile(r"\b(with\s+luggage|luggage\s+service|a\s+luggage\s+consignment)\b", re.I)
+_NO_LUG   = re.compile(r"\b(no\s+luggage|without\s+luggage)\b", re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -73,14 +75,14 @@ _HAS_LUG  = re.compile(r"\b(with\s+luggage|luggage\s+service)\b", re.I)
 
 @dataclass
 class Oracle:
-    account:     str  = "fdse_microservice"
+    account:     str  = ""
     balance:     int  = 10_000
-    system_date: date = field(default_factory=lambda: date(2026, 9, 15))
-    trip_date:   date = field(default_factory=lambda: date(2026, 10, 1))
+    system_date: date = field(default_factory=date.today)
+    trip_date:   date = field(default_factory=date.today)
     train_type:  str  = ""        # "G" | "D" | ""
     seat_class:  str  = ""        # "FIRST" | "SECOND" | ""
     order_status: str = ""        # "INIT" | "PAID" | "CANCELLED" | ""
-    has_food:     bool = False
+    has_food:      bool = False
     has_insurance: bool = False
     has_luggage:   bool = False
     active_services: set = field(default_factory=set)
@@ -112,7 +114,7 @@ class Oracle:
             self.has_food = True
         if _HAS_INS.search(text) and not _NO_INS.search(text):
             self.has_insurance = True
-        if _HAS_LUG.search(text):
+        if _HAS_LUG.search(text) and not _NO_LUG.search(text):
             self.has_luggage = True
 
         return self
