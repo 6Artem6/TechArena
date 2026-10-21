@@ -88,6 +88,9 @@ _STEP_RULES: list[tuple[str, list[str]]] = _load_step_rules()
 # Dataclass результата
 # ---------------------------------------------------------------------------
 
+_SYSTEM_REFUSES = re.compile(r'\bthe\s+system\s+(refuses|rejects|denies)\b', re.I)
+
+
 @dataclass
 class StepInfo:
     step_type: str = "unknown"
@@ -96,6 +99,7 @@ class StepInfo:
     has_food: bool | None = None
     has_insurance: bool | None = None
     has_luggage: bool | None = None
+    is_refused: bool = False     # "the system refuses" — шаг отклонён системой
     # Дополнительные BM25-токены, выведенные из типа шага
     extra_tokens: list[str] = field(default_factory=list)
 
@@ -151,6 +155,10 @@ def classify(action: str, step_params: "StepParams | None" = None) -> StepInfo:
     """
     text = action.lower()
     info = StepInfo()
+
+    # is_refused: шаг явно помечён как отклонённый системой → не добавлять сервис в trace
+    if _SYSTEM_REFUSES.search(action):
+        info.is_refused = True
 
     # train_type — всегда regex: D-train→G mapping намеренный, Qwen не знает этот трюк.
     # step_type — Qwen primary (NL-понимание шире regex), regex как fallback.

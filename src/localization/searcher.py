@@ -954,6 +954,11 @@ def enhanced_ground(
                         file=sys.stderr,
                     )
 
+        # Refused steps: "the system refuses/rejects" → HTTP запрос не отправляется →
+        # методы не входят в execution trace.
+        if step_info.is_refused:
+            hs = set()
+
         # --- FSM Transitions: Qwen decomposed condition matching ---
         # ОТКЛЮЧЕНО: forward_expand → S6 +16 FP, S7 +12 FP (assurance/food добавляются
         # для сценариев без страхования/еды). archive ≠ gold: assurance не в gold для S2/S6/S7.
