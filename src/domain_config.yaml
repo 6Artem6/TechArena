@@ -7,41 +7,12 @@
 # Все regex-паттерны в single-quoted YAML строках: backslash сохраняется буквально
 # (YAML single-quote: только '' экранирует апостроф).
 
-# ---------------------------------------------------------------------------
-# Именование сервисов
-# ---------------------------------------------------------------------------
-service_naming:
-  prefix: "ts-"
-  suffix: "-service"
-
-# ---------------------------------------------------------------------------
-# Паттерны обнаружения опциональных фич в тексте шагов сценария.
+# service_naming, optional_service_groups убраны:
+#   генерируются из скелета через scripts/gen_project_config.py → cache/project_config.json
 #
-# Формат: полный Python regex (single-quoted YAML → backslash буквально).
-# Эти паттерны могут быть перегенерированы Qwen через scripts/gen_optional_patterns.py;
-# тогда конфиг служит только fallback при отсутствии кеша.
-# ---------------------------------------------------------------------------
-optional_service_patterns:
-  has_food:      '\b(with\s+food|order\s+food|food\s+service|station\s+food|food\s+from\s+a\s+station|food\s+on\s+the\s+train)\b'
-  no_food:       '\b(no\s+food|without\s+food)\b'
-  has_insurance: '\bwith\b.{0,80}\b(assurance|insurance)\b'
-  no_insurance:  '\b(without|no)\b.{0,80}\b(assurance|insurance)\b'
-  has_luggage:   '\b(with\s+luggage|luggage\s+service|a\s+luggage\s+consignment|consign)\b'
-  no_luggage:    '\b(no\s+luggage|without\s+luggage)\b'
-
-# ---------------------------------------------------------------------------
-# Опциональные группы сервисов (исключаются из BFS если сценарий не использует фичу)
-# ---------------------------------------------------------------------------
-optional_service_groups:
-  food:
-    - "ts-food-service"
-    - "ts-food-delivery-service"
-    - "ts-train-food-service"
-    - "ts-station-food-service"
-  insurance:
-    - "ts-assurance-service"
-  consign:
-    - "ts-consign-service"
+# optional_service_patterns убраны:
+#   генерируются через scripts/gen_optional_patterns.py → cache/optional_patterns.json
+#   fallback при отсутствии кеша — ValueError (Qwen должен быть доступен)
 
 # ---------------------------------------------------------------------------
 # Директории, исключённые при обходе репозитория (walker.py)
@@ -66,19 +37,8 @@ excluded_dirs:
   - venv            # Python virtual env
   - .git            # Git metadata
 
-# ---------------------------------------------------------------------------
-# Функциональные суффиксы сиблинг-вариантов сервисов (siblings.py)
-# ts-route-plan-service ↔ ts-route-service
-# ---------------------------------------------------------------------------
-func_variant_suffixes:
-  - plan
-  - price
-  - delivery
-  - map
-  - info
-  - basic
-  - payment
-  - query
+# func_variant_suffixes убраны:
+#   генерируются из скелета через scripts/gen_project_config.py → cache/project_config.json
 
 # ---------------------------------------------------------------------------
 # Token Taxonomy — классификация токенов имён сервисов (service_classifier.py)

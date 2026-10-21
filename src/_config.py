@@ -58,13 +58,26 @@ def _load() -> dict[str, Any]:
         return _cfg
     if not _CONFIG_PATH.exists():
         _cfg = {}
-        return _cfg
-    try:
-        import yaml  # PyYAML — опциональная зависимость; без него — пустой конфиг
-        with _CONFIG_PATH.open(encoding="utf-8") as f:
-            _cfg = yaml.safe_load(f) or {}
-    except Exception:
-        _cfg = {}
+    else:
+        try:
+            import yaml  # PyYAML — опциональная зависимость; без него — пустой конфиг
+            with _CONFIG_PATH.open(encoding="utf-8") as f:
+                _cfg = yaml.safe_load(f) or {}
+        except Exception:
+            _cfg = {}
+
+    # Merge сгенерированного project_config.json поверх YAML.
+    # Ключи из кеша имеют приоритет — YAML остаётся fallback.
+    _project_cfg_path = cfg_cache_dir() / "project_config.json"
+    if _project_cfg_path.exists():
+        try:
+            import json as _json
+            _proj = _json.loads(_project_cfg_path.read_text(encoding="utf-8"))
+            if isinstance(_proj, dict):
+                _cfg.update(_proj)
+        except Exception:
+            pass
+
     return _cfg
 
 
