@@ -30,14 +30,19 @@ from pydantic import BaseModel, Field, ValidationError
 if TYPE_CHECKING:
     from src.trace.oracle import Oracle
 
-_OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
-_OLLAMA_TAGS_URL     = "http://localhost:11434/api/tags"
-_DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:3b"
-_HF_MODEL_NAME       = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-_TIMEOUT_S           = 10
-_NUM_PREDICT         = 40   # индекс = 1-3 цифры, нет нужды в 160 токенах
-_MIN_CONFIDENCE      = 0.55  # инжект только при confidence >= этого порога
-_CACHE_FILE          = Path(__file__).parents[2] / "cache" / "qwen_encoder_cache.pkl"
+import os as _os
+_OLLAMA_BASE_URL      = _os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+_OLLAMA_GENERATE_URL  = f"{_OLLAMA_BASE_URL}/api/generate"
+_OLLAMA_TAGS_URL      = f"{_OLLAMA_BASE_URL}/api/tags"
+_DEFAULT_OLLAMA_MODEL = _os.getenv("OLLAMA_MODEL", "qwen2.5-coder:3b")
+_HF_MODEL_NAME        = _os.getenv("HF_QWEN_MODEL", "Qwen/Qwen2.5-Coder-1.5B-Instruct")
+_TIMEOUT_S            = 10
+_NUM_PREDICT          = 40   # индекс = 1-3 цифры, нет нужды в 160 токенах
+_MIN_CONFIDENCE       = 0.55  # инжект только при confidence >= этого порога
+
+def _qwen_cache_path() -> Path:
+    from src._config import cfg_cache_dir
+    return cfg_cache_dir() / "qwen_encoder_cache.pkl"
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +315,7 @@ class QwenEncoder:
     @staticmethod
     def _load_cache() -> "dict[tuple, object]":
         try:
-            with open(_CACHE_FILE, "rb") as fh:
+            with open(_qwen_cache_path(), "rb") as fh:
                 data = pickle.load(fh)
             # Принимаем QwenOutput (handler selection) и QwenClassifyOutput (Pass 1)
             valid = {
@@ -324,8 +329,8 @@ class QwenEncoder:
 
     def _save_cache(self) -> None:
         try:
-            _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(_CACHE_FILE, "wb") as fh:
+            _qwen_cache_path().parent.mkdir(parents=True, exist_ok=True)
+            with open(_qwen_cache_path(), "wb") as fh:
                 pickle.dump(self._cache, fh)
         except Exception as e:
             print(f"[qwen] кеш не сохранён: {e}", file=sys.stderr)

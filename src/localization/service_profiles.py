@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     pass
 
-_CACHE_KEY_VERSION = "sp_v1"
+_CACHE_KEY_VERSION = "v1"
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,8 @@ def load_profiles(cache_path: str | None = None) -> dict[str, ServiceProfile]:
     from pathlib import Path
 
     if cache_path is None:
-        cache_path = str(Path(__file__).parents[2] / "cache" / "service_profiles_v1.pkl")
+        from src._config import cfg_cache_dir
+        cache_path = str(cfg_cache_dir() / f"service_profiles_{_CACHE_KEY_VERSION}.pkl")
 
     path = Path(cache_path)
     if not path.exists():

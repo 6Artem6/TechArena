@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 
-_HERE = Path(__file__).parent.parent.parent
+from src._config import _ROOT as _HERE
 sys.path.insert(0, str(_HERE))
 
 from src.core.nlp import expand, query_toks, ADMIN, toks  # noqa: E402
