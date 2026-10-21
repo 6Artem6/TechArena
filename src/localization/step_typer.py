@@ -253,10 +253,21 @@ def _build_extra_tokens(
     if info.step_type == "query_insurance":
         tokens.extend(["assurance", "assurance"])
 
-    # update_consign / add_consign: "consignment" в тексте → ['consignment'] ≠ ['consign'] в handler-ах
-    # (updateConsign, insertConsign). Явный "consign" устраняет разрыв без влияния на query_consign.
-    if info.step_type in ("update_consign", "add_consign"):
+    # update_consign: "update" extra → updateConsign score > insertConsign score →
+    # разделяет update vs insert в tau-window (иначе оба в hs → insertConsign FP).
+    if info.step_type == "update_consign":
+        tokens.extend(["consign", "consign", "update"])
+    # add_consign: "insert" extra → insertConsign score > updateConsign.
+    if info.step_type == "add_consign":
+        tokens.extend(["consign", "consign", "insert"])
+    # query_consign: только "consign" — нет специфики кроме запроса записей.
+    if info.step_type == "query_consign":
         tokens.extend(["consign", "consign"])
+
+    # query_orders: "refresh/filter/view" → tokens ["query", "order", "orders"] →
+    # усиливает queryOrders, getAllOrders в order-service (1 overlap → 3 overlap).
+    if info.step_type == "query_orders":
+        tokens.extend(["query", "order", "orders"])
 
     # check_refund: "calculate"×2 — boost ts-cancel-service/calculate над прочими
     # "refund" из action уже есть в query; "calculate" добавляет прямой сигнал сервиса

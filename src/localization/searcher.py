@@ -772,7 +772,7 @@ def enhanced_ground(
         # _CE_DOC_TEXTS: verb+path+name + javadoc + logger msgs + class neighbors.
         _ce_docs = _CE_DOC_TEXTS if _CE_DOC_TEXTS is not None else _DOC_TEXTS
         if _CROSS_ENCODER is not None and _CROSS_ENCODER.enabled and _ce_docs is not None:
-            ranked = _CROSS_ENCODER.rerank(act, ranked, _ce_docs, top_k=20, alpha=0.3)
+            ranked = _CROSS_ENCODER.rerank(act, ranked, _ce_docs, top_k=30, alpha=0.3)
 
         # --- Graph flow boost (zero-hardcode: topology-based branch consistency) ---
         if flow_ctx is not None:
@@ -955,17 +955,14 @@ def enhanced_ground(
                     )
 
         # --- FSM Transitions: Qwen decomposed condition matching ---
-        # Qwen StepParams.services → condition queries → CE vs FSM condition_text.
-        # "food station" vs "order includes food" = 0.976 ✓ (raw action = 0.22 ✗).
-        # Negation: absent service → not in queries → FSM condition не активируется.
-        # Fallback: если service_queries пусты → raw action_text через CE.
-        # Unconditional transitions пропускаются (источник FP).
-        if hs:
-            _ce = _CROSS_ENCODER if _CROSS_ENCODER is not None and _CROSS_ENCODER.enabled else None
-            _enc = _RERANKER if _RERANKER is not None and _RERANKER.enabled else None
-            if _ce is not None or _enc is not None:
-                hs = forward_expand(hs, ix, action_text=act, encoder=_enc, cross_encoder=_ce,
-                                    step_params=_qwen_classify)
+        # ОТКЛЮЧЕНО: forward_expand → S6 +16 FP, S7 +12 FP (assurance/food добавляются
+        # для сценариев без страхования/еды). archive ≠ gold: assurance не в gold для S2/S6/S7.
+        # if hs:
+        #     _ce = _CROSS_ENCODER if _CROSS_ENCODER is not None and _CROSS_ENCODER.enabled else None
+        #     _enc = _RERANKER if _RERANKER is not None and _RERANKER.enabled else None
+        #     if _ce is not None or _enc is not None:
+        #         hs = forward_expand(hs, ix, action_text=act, encoder=_enc, cross_encoder=_ce,
+        #                             step_params=_qwen_classify)
 
         # Записать граф-состояние шага для следующего (zero-hardcode flow tracking)
         if flow_ctx is not None and hs:

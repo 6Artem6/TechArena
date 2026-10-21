@@ -157,6 +157,16 @@ oracle_train_patterns:
 # Дублирование type (query_orders дважды) намеренно — дополнительный вариант.
 # ---------------------------------------------------------------------------
 step_rules:
+  # update_consign ПЕРЕД query_consign: иначе 'consignment record' (query_consign)
+  # перехватывает "Update the luggage consignment record" до проверки update_consign.
+  - type: update_consign
+    patterns:
+      - 'change.*consign'
+      - 'update.*consign'
+      - 'modify.*consign'
+      - "change.*consignee's"
+      - "update.*consignee"
+
   # Консигнация выше register (иначе "registered on the account" → register)
   - type: query_consign
     patterns:
@@ -166,16 +176,6 @@ step_rules:
       - 'luggage consignment.*registered'
       - 'check what.*consign'
       - 'list of.*consign'
-
-  # Изменение данных консигнации (выше add_consign: "change" не "add")
-  # 'consignee' убран: слово встречается в booking-текстах ("to a consignee") → FP
-  - type: update_consign
-    patterns:
-      - 'change.*consign'
-      - 'update.*consign'
-      - 'modify.*consign'
-      - "change.*consignee's"
-      - "update.*consignee"
 
   # Только отдельный шаг добавления консигнации (не при бронировании)
   - type: add_consign

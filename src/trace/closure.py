@@ -264,6 +264,44 @@ def _get_executes_infra(index: Index) -> frozenset[str]:
     return _EXECUTES_INFRA_CACHE
 
 
+_NON_ENTRY_MODULES_CACHE: frozenset[str] | None = None
+
+
+def _get_non_entry_modules(index: Index) -> frozenset[str]:
+    """Топологически: модули без HTTP entry points.
+
+    Эти модули (ts-common, ts-gateway-service, ...) не имеют @RequestMapping handlers
+    → содержат только shared utilities/entities/DTOs.
+    Определяется через граф-топологию скелета, без hardcode имён модулей.
+    """
+    global _NON_ENTRY_MODULES_CACHE
+    if _NON_ENTRY_MODULES_CACHE is None:
+        handler_mods = frozenset(
+            index.module.get(nid, "") for nid, _, _ in index.handlers
+        ) - frozenset([""])
+        all_mods = frozenset(index.module.values()) - frozenset([""])
+        _NON_ENTRY_MODULES_CACHE = all_mods - handler_mods
+    return _NON_ENTRY_MODULES_CACHE
+
+
+def _is_shallow_method(nid: str, index: Index, non_entry_mods: frozenset[str]) -> bool:
+    """True если метод — shallow getter/enum/util из non-entry модуля.
+
+    Топологический критерий (zero-hardcode):
+      - принадлежит модулю без HTTP handlers
+      - не конструктор (<init>)
+      - 0 исходящих calls (простой getter, enum accessor, utility)
+    """
+    if index.module.get(nid, "") not in non_entry_mods:
+        return False
+    node = index.N.get(nid, {})
+    if node.get("kind") != "method":
+        return False
+    if node.get("name") == "<init>":
+        return False
+    return not index.calls.get(nid)
+
+
 def pruned_closure(
     entries: set[str],
     index: Index,
