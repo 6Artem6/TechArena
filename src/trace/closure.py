@@ -27,36 +27,59 @@ from src.localization.searcher import _is_g_service, _is_other_service  # noqa: 
 
 _SECURITY_FILTERS_CACHE: set[str] | None = None
 
-def _get_security_filter_cfg() -> tuple[list[str], str]:
-    """Загрузить критерии JWT-фильтра из domain_config.yaml."""
+def _get_security_filter_cfg() -> tuple[list[str], str, list[str], list[str]]:
+    """Загрузить критерии Security-фильтра из domain_config.yaml."""
     cfg = cfg_get("security_filter", {})
-    markers = cfg.get("fqn_markers", [".jwt.", ".security.jwt."])
-    prefix  = cfg.get("method_prefix", "doFilter")
-    return markers, prefix
+    fqn_markers     = cfg.get("fqn_markers", [".jwt.", ".security.jwt."])
+    method_prefix   = cfg.get("method_prefix", "doFilter")
+    extends_markers = cfg.get("extends_markers", ["OncePerRequestFilter", "GenericFilterBean"])
+    impl_markers    = cfg.get("implements_markers", ["javax.servlet.Filter", "jakarta.servlet.Filter"])
+    return fqn_markers, method_prefix, extends_markers, impl_markers
 
 
 def _detect_security_filters(index: Index) -> set[str]:
     """Найти Spring Security фильтры в скелете (ленивая инициализация).
 
-    Ищет методы вида:
-      kind=method + FQN содержит один из fqn_markers + имя начинается с method_prefix
+    Два пути поиска (оба из domain_config.yaml → security_filter):
+      1. Inheritance path: тип extends OncePerRequestFilter / GenericFilterBean
+         или implements javax/jakarta.servlet.Filter → методы с method_prefix
+      2. FQN-marker path (legacy): FQN содержит .jwt. — fallback для совместимости
+         и для будущих фреймворков, где extends_raw не заполнен в скелете.
 
-    Критерии берутся из domain_config.yaml → security_filter (P-57).
+    Это поддерживает javax (Spring Boot 2) и jakarta (Spring Boot 3+) без хардкода.
     """
     global _SECURITY_FILTERS_CACHE
     if _SECURITY_FILTERS_CACHE is not None:
         return _SECURITY_FILTERS_CACHE
 
-    fqn_markers, method_prefix = _get_security_filter_cfg()
+    fqn_markers, method_prefix, extends_markers, impl_markers = _get_security_filter_cfg()
+    extends_set = set(extends_markers)
+    impl_set    = set(impl_markers)
+
+    # Path 1: найти типы через extends_raw / implements_raw
+    filter_type_nids: set[str] = set()
+    for nid, node in index.N.items():
+        if node.get("kind") != "type":
+            continue
+        ext  = set(node.get("extends_raw") or [])
+        impl = set(node.get("implements_raw") or [])
+        if ext & extends_set or impl & impl_set:
+            filter_type_nids.add(nid)
 
     filters: set[str] = set()
+
+    # Методы найденных типов с нужным prefix
     for nid, node in index.N.items():
         if node.get("kind") != "method":
             continue
         name = node.get("name", "")
         if not name.startswith(method_prefix):
             continue
-        # NodeId формат: "method:{module}:{fqn}#methodName(...)"
+        if node.get("owner", "") in filter_type_nids:
+            filters.add(nid)
+            continue
+
+        # Path 2: legacy FQN-marker (fallback)
         parts = nid.split(":", 2)
         if len(parts) < 3:
             continue

@@ -379,7 +379,7 @@ account: str = "fdse_microservice"
 
 ---
 
-## TD-17. `.jwt.` / `.security.jwt.` — паттерн Spring специфичен
+## TD-17. ✅ `.jwt.` / `.security.jwt.` — паттерн Spring специфичен
 
 Частично описан в TD-11, но есть более глубокая проблема:
 `doFilter` — это интерфейс `javax.servlet.Filter`. В Spring Boot 3+ пакет сменился на
@@ -412,7 +412,7 @@ account: str = "fdse_microservice"
 | TD-14 ✅ | service_profiles.py | Backward compat hasattr shim | Мусор | 30 мин | Низкий |
 | TD-15 | oracle.py | Конкретные даты 2026 | Домен | 5 мин | Низкий |
 | TD-16 | oracle.py | `account = "fdse_microservice"` | Домен | 5 мин | Очень низкий |
-| TD-17 | closure.py | javax vs jakarta Filter | Домен | 1 час | Средний |
+| TD-17 ✅ | closure.py | javax vs jakarta Filter | Домен | 1 час | Средний |
 
 **Быстрые победы (< 30 мин суммарно):** TD-6 + TD-15 + TD-16 — удаление мусора без риска.  
 **Наибольший прирост переносимости:** TD-1 + TD-2 + TD-3 — вынести пути и имена сервисов в env/конфиг.  

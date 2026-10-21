@@ -187,12 +187,23 @@ oracle_train_patterns:
 # Spring Security фильтр — критерии авто-обнаружения (closure.py, P-57/P-101)
 # ---------------------------------------------------------------------------
 security_filter:
-  # Подстроки FQN, сигнализирующие о JWT фильтре (проверка через `in`)
+  # Подстроки FQN, сигнализирующие о JWT фильтре (устаревший путь — legacy fallback)
   fqn_markers:
     - ".jwt."
     - ".security.jwt."
   # Метод, который должен начинаться с этого prefix
   method_prefix: "doFilter"
+  # Родительские классы (extends_raw) — Spring Security фильтры
+  # OncePerRequestFilter: Spring (javax); до Spring 6 / Boot 3 использует javax.servlet
+  # GenericFilterBean: старый Spring способ (встречается редко)
+  extends_markers:
+    - "OncePerRequestFilter"
+    - "GenericFilterBean"
+  # Интерфейсы (implements_raw) — напрямую в скелете обычно не заполняется
+  # но добавлено для поддержки jakarta.servlet (Spring Boot 3+, Jakarta EE 9+)
+  implements_markers:
+    - "javax.servlet.Filter"
+    - "jakarta.servlet.Filter"
 
 # ---------------------------------------------------------------------------
 # Правила классификации шагов сценария (step_typer.py)
