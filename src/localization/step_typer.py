@@ -16,13 +16,11 @@ if TYPE_CHECKING:
     from src.localization.qwen_encoder import StepParams
 
 
-# Шаги, для которых Qwen keywords безопасно инжектировать в extra_tokens.
-# Для search/* и view_trip keywords ("cheapest", "trips") сдвигают BM25 вредно.
-_SAFE_KEYWORD_TYPES = frozenset({
+_SAFE_KEYWORD_TYPES = frozenset(cfg_get("safe_keyword_step_types", [
     "book", "pay", "cancel", "collect", "rebook",
     "enter_station", "add_consign", "query_consign",
     "check_price", "check_refund",
-})
+]))
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import sys
 
-from src._config import _ROOT as _HERE
+from src._config import _ROOT as _HERE, cfg_get
 sys.path.insert(0, str(_HERE))
 
 from src.core.skeleton_index import Index  # noqa: E402
@@ -27,32 +27,41 @@ from src.localization.searcher import _is_g_service, _is_other_service  # noqa: 
 
 _SECURITY_FILTERS_CACHE: set[str] | None = None
 
+def _get_security_filter_cfg() -> tuple[list[str], str]:
+    """Загрузить критерии JWT-фильтра из domain_config.yaml."""
+    cfg = cfg_get("security_filter", {})
+    markers = cfg.get("fqn_markers", [".jwt.", ".security.jwt."])
+    prefix  = cfg.get("method_prefix", "doFilter")
+    return markers, prefix
+
 
 def _detect_security_filters(index: Index) -> set[str]:
     """Найти Spring Security фильтры в скелете (ленивая инициализация).
 
     Ищет методы вида:
-      kind=method + пакет содержит '.jwt.' + имя начинается с 'doFilter'
+      kind=method + FQN содержит один из fqn_markers + имя начинается с method_prefix
 
-    Это заменяет хардкод NodeId JWTFilter (P-57).
+    Критерии берутся из domain_config.yaml → security_filter (P-57).
     """
     global _SECURITY_FILTERS_CACHE
     if _SECURITY_FILTERS_CACHE is not None:
         return _SECURITY_FILTERS_CACHE
+
+    fqn_markers, method_prefix = _get_security_filter_cfg()
 
     filters: set[str] = set()
     for nid, node in index.N.items():
         if node.get("kind") != "method":
             continue
         name = node.get("name", "")
-        if not name.startswith("doFilter"):
+        if not name.startswith(method_prefix):
             continue
         # NodeId формат: "method:{module}:{fqn}#methodName(...)"
         parts = nid.split(":", 2)
         if len(parts) < 3:
             continue
-        fqn = parts[2]  # "edu.fudan.common.security.jwt.JWTFilter#doFilter..."
-        if ".jwt." in fqn or ".security.jwt." in fqn:
+        fqn = parts[2]
+        if any(marker in fqn for marker in fqn_markers):
             filters.add(nid)
 
     _SECURITY_FILTERS_CACHE = filters

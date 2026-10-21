@@ -227,7 +227,7 @@ _suffix = cfg_get("service_naming", {}).get("suffix", "")
 
 ---
 
-## TD-10. _safe_keyword_types вшит в step_typer.py вместо конфига
+## TD-10. ✅ _safe_keyword_types вшит в step_typer.py вместо конфига
 
 **Файл:** `src/localization/step_typer.py:21-25`
 
@@ -255,7 +255,7 @@ safe_keyword_step_types:
 
 ---
 
-## TD-11. JWT-фильтр ищется по `.jwt.` в fqn — неявный контракт
+## TD-11. ✅ JWT-фильтр ищется по `.jwt.` в fqn — неявный контракт
 
 **Файл:** `src/trace/closure.py:56`
 
@@ -300,7 +300,7 @@ sys.path.insert(0, str(_ROOT))
 
 ---
 
-## TD-13. Версия в имени cache-файла: `service_profiles_v1.pkl`
+## TD-13. ✅ Версия в имени cache-файла: `service_profiles_v1.pkl`
 
 **Файл:** `src/localization/service_profiles.py:55`
 
@@ -405,10 +405,10 @@ account: str = "fdse_microservice"
 | TD-7 | step_typer.py | NOT_G не из конфига | Конфиг | 10 мин | Низкий |
 | TD-8 | qwen_encoder.py | Ollama URL/модель хардкод | Путь/конфиг | 15 мин | Средний |
 | TD-9 | predict.py | ts-/-service strip повторно | Конфиг | 10 мин | Низкий |
-| TD-10 | step_typer.py | safe_keyword_types вшит в код | Конфиг | 20 мин | Низкий |
-| TD-11 | closure.py | JWT-пакет `.jwt.` хардкод | Домен | 30 мин | Низкий |
-| TD-12 | closure.py, searcher.py | `parents[3]` для sys.path | Путь | 20 мин | Средний |
-| TD-13 | service_profiles.py | Версия pkl в имени файла | Конфиг | 15 мин | Средний |
+| TD-10 ✅ | step_typer.py | safe_keyword_types вшит в код | Конфиг | 20 мин | Низкий |
+| TD-11 ✅ | closure.py | JWT-пакет `.jwt.` хардкод | Домен | 30 мин | Низкий |
+| TD-12 ✅ | closure.py, searcher.py | `parents[3]` для sys.path | Путь | 20 мин | Средний |
+| TD-13 ✅ | service_profiles.py | Версия pkl в имени файла | Конфиг | 15 мин | Средний |
 | TD-14 | service_profiles.py | Backward compat hasattr shim | Мусор | 30 мин | Низкий |
 | TD-15 | oracle.py | Конкретные даты 2026 | Домен | 5 мин | Низкий |
 | TD-16 | oracle.py | `account = "fdse_microservice"` | Домен | 5 мин | Очень низкий |

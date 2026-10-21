@@ -184,6 +184,17 @@ oracle_train_patterns:
 # авто-обнаруживаются из скелета в src/trace/closure.py через implements_raw + @Override.
 
 # ---------------------------------------------------------------------------
+# Spring Security фильтр — критерии авто-обнаружения (closure.py, P-57/P-101)
+# ---------------------------------------------------------------------------
+security_filter:
+  # Подстроки FQN, сигнализирующие о JWT фильтре (проверка через `in`)
+  fqn_markers:
+    - ".jwt."
+    - ".security.jwt."
+  # Метод, который должен начинаться с этого prefix
+  method_prefix: "doFilter"
+
+# ---------------------------------------------------------------------------
 # Правила классификации шагов сценария (step_typer.py)
 #
 # Порядок важен: первый match выигрывает.
@@ -419,6 +430,22 @@ step_rules:
       - 'paid'
       - 'filter.*paid'
       - 'paid.*filter'
+
+# ---------------------------------------------------------------------------
+# Типы шагов, для которых Qwen keywords безопасно инжектировать в extra_tokens.
+# Для search/* и view_trip keywords ("cheapest", "trips") сдвигают BM25 вредно.
+# ---------------------------------------------------------------------------
+safe_keyword_step_types:
+  - book
+  - pay
+  - cancel
+  - collect
+  - rebook
+  - enter_station
+  - add_consign
+  - query_consign
+  - check_price
+  - check_refund
 
 # action_vocabulary удалён: семантический мост NL → code обеспечивается
 # dense-векторами (SemanticReranker / BGE-M3) в src/similarity/encoder.py.

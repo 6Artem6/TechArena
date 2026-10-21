@@ -19,6 +19,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 
+# Динамически вычислить имя файла кеша service_profiles
+def _sp_cache_filename() -> str:
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(ROOT))
+        from src.localization.service_profiles import _CACHE_KEY_VERSION
+        return f"cache/service_profiles_{_CACHE_KEY_VERSION}.pkl"
+    except Exception:
+        return "cache/service_profiles_v1.pkl"
+
 # Сценарии в порядке как принято на платформе
 SCENARIOS = [f"tt-challenge/scenarios/S{i}.json" for i in range(8)]
 
@@ -187,7 +197,7 @@ CACHE_FILES: list[str] = [
     "cache/ce_scores_cache.pkl",
     "cache/fsm_transitions.json",
     "cache/sibling_metadata.json",
-    "cache/service_profiles_v1.pkl",
+    _sp_cache_filename(),
 ]
 
 
