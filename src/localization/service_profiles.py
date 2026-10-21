@@ -6,7 +6,7 @@
   - vector_search_phrases — NL-фразы для сервисного intent-matching
   - handled_parameters  — какие booking-параметры обрабатывает сервис
 
-Оффлайн: gen_service_profiles.py → cache/service_profiles_v1.pkl
+Оффлайн: gen_service_profiles.py → cache/service_profiles_v2.pkl
 Runtime: load_profiles() → score_profiles(action) → top-K сервисов
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     pass
 
-_CACHE_KEY_VERSION = "v1"
+_CACHE_KEY_VERSION = "v2"
 
 
 # ---------------------------------------------------------------------------
@@ -66,9 +66,6 @@ def load_profiles(cache_path: str | None = None) -> dict[str, ServiceProfile]:
     _profiles_cache = {}
     for item in raw.values():
         if isinstance(item, ServiceProfile):
-            # Backward compat: старые pickled объекты не имеют поля tags
-            if not hasattr(item, "tags"):
-                item.tags = []
             _profiles_cache[item.service_name] = item
 
     return _profiles_cache

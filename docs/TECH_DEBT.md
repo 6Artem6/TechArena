@@ -324,7 +324,7 @@ pack.py тогда ищет `cache/service_profiles_*.pkl` вместо жёст
 
 ---
 
-## TD-14. Backward compat patch в load_profiles() — "старые pickled объекты не имеют tags"
+## TD-14. ✅ Backward compat patch в load_profiles() — "старые pickled объекты не имеют tags"
 
 **Файл:** `src/localization/service_profiles.py:67-70`
 
@@ -409,7 +409,7 @@ account: str = "fdse_microservice"
 | TD-11 ✅ | closure.py | JWT-пакет `.jwt.` хардкод | Домен | 30 мин | Низкий |
 | TD-12 ✅ | closure.py, searcher.py | `parents[3]` для sys.path | Путь | 20 мин | Средний |
 | TD-13 ✅ | service_profiles.py | Версия pkl в имени файла | Конфиг | 15 мин | Средний |
-| TD-14 | service_profiles.py | Backward compat hasattr shim | Мусор | 30 мин | Низкий |
+| TD-14 ✅ | service_profiles.py | Backward compat hasattr shim | Мусор | 30 мин | Низкий |
 | TD-15 | oracle.py | Конкретные даты 2026 | Домен | 5 мин | Низкий |
 | TD-16 | oracle.py | `account = "fdse_microservice"` | Домен | 5 мин | Очень низкий |
 | TD-17 | closure.py | javax vs jakarta Filter | Домен | 1 час | Средний |
