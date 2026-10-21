@@ -15,6 +15,21 @@ service_naming:
   suffix: "-service"
 
 # ---------------------------------------------------------------------------
+# Паттерны обнаружения опциональных фич в тексте шагов сценария.
+#
+# Формат: полный Python regex (single-quoted YAML → backslash буквально).
+# Эти паттерны могут быть перегенерированы Qwen через scripts/gen_optional_patterns.py;
+# тогда конфиг служит только fallback при отсутствии кеша.
+# ---------------------------------------------------------------------------
+optional_service_patterns:
+  has_food:      '\b(with\s+food|order\s+food|food\s+service|station\s+food|food\s+from\s+a\s+station|food\s+on\s+the\s+train)\b'
+  no_food:       '\b(no\s+food|without\s+food)\b'
+  has_insurance: '\bwith\b.{0,80}\b(assurance|insurance)\b'
+  no_insurance:  '\b(without|no)\b.{0,80}\b(assurance|insurance)\b'
+  has_luggage:   '\b(with\s+luggage|luggage\s+service|a\s+luggage\s+consignment|consign)\b'
+  no_luggage:    '\b(no\s+luggage|without\s+luggage)\b'
+
+# ---------------------------------------------------------------------------
 # Опциональные группы сервисов (исключаются из BFS если сценарий не использует фичу)
 # ---------------------------------------------------------------------------
 optional_service_groups:

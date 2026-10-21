@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
-from .._config import cfg_get
+from .._config import cfg_get, build_optional_re
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +59,12 @@ _TRAIN_NOT_G = _build_not_g_re()
 
 _SEAT_1ST = re.compile(r"\b(first.?class|business.?class|1st.?class)\b", re.I)
 _SEAT_2ND = re.compile(r"\b(second.?class|economy|2nd.?class|standard)\b", re.I)
-_HAS_FOOD = re.compile(
-    r"\b(with\s+food|order\s+food|food\s+service|station\s+food|food\s+from\s+a\s+station)\b", re.I)
-_NO_FOOD  = re.compile(r"\b(no\s+food|without\s+food)\b", re.I)
-_HAS_INS  = re.compile(r"\bwith\b.{0,80}\b(assurance|insurance)\b", re.I)
-_NO_INS   = re.compile(r"\b(without|no)\b.{0,80}\b(assurance|insurance)\b", re.I)
-_HAS_LUG  = re.compile(r"\b(with\s+luggage|luggage\s+service|a\s+luggage\s+consignment)\b", re.I)
-_NO_LUG   = re.compile(r"\b(no\s+luggage|without\s+luggage)\b", re.I)
+_HAS_FOOD = build_optional_re("has_food")
+_NO_FOOD  = build_optional_re("no_food")
+_HAS_INS  = build_optional_re("has_insurance")
+_NO_INS   = build_optional_re("no_insurance")
+_HAS_LUG  = build_optional_re("has_luggage")
+_NO_LUG   = build_optional_re("no_luggage")
 
 
 # ---------------------------------------------------------------------------

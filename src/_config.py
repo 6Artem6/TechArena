@@ -22,6 +22,36 @@ def cfg_cache_dir() -> Path:
     return Path(os.getenv("TT_CACHE_DIR", str(_ROOT / "cache")))
 
 
+def build_optional_re(key: str) -> "re.Pattern[str]":
+    """Собрать regex для optional_service_patterns[key].
+
+    Порядок поиска:
+      1. cache/optional_patterns.json (сгенерированный Qwen офлайн)
+      2. domain_config.yaml optional_service_patterns[key]
+    Raise ValueError если ключ не найден нигде.
+    """
+    import re as _re
+
+    # 1. Кеш (Qwen-generated)
+    cache_file = cfg_cache_dir() / "optional_patterns.json"
+    if cache_file.exists():
+        try:
+            import json as _json
+            cached = _json.loads(cache_file.read_text(encoding="utf-8"))
+            pat = cached.get(key)
+            if pat:
+                return _re.compile(pat, _re.I)
+        except Exception:
+            pass
+
+    # 2. YAML fallback
+    pat = cfg_get("optional_service_patterns", {}).get(key)
+    if pat:
+        return _re.compile(pat, _re.I)
+
+    raise ValueError(f"optional_service_patterns.{key} не найден (ни в кеше, ни в YAML)")
+
+
 def _load() -> dict[str, Any]:
     global _cfg
     if _cfg is not None:
