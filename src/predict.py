@@ -36,7 +36,15 @@ from src.localization.service_classifier import (                 # noqa: E402
 )
 from src.trace.oracle import Oracle                               # noqa: E402
 from src.enrichment.ast_calls import patch_calls                  # noqa: E402
+from src._config import cfg_get                                   # noqa: E402
 
+# ---------------------------------------------------------------------------
+# Опциональные группы сервисов — из domain_config.yaml
+# ---------------------------------------------------------------------------
+_OPT_GROUPS = cfg_get("optional_service_groups", {})
+_FOOD_MODS    = frozenset(_OPT_GROUPS.get("food",      ["ts-food-service", "ts-food-delivery-service", "ts-train-food-service", "ts-station-food-service"]))
+_INS_MODS     = frozenset(_OPT_GROUPS.get("insurance", ["ts-assurance-service"]))
+_CONSIGN_MODS = frozenset(_OPT_GROUPS.get("consign",   ["ts-consign-service"]))
 
 # ---------------------------------------------------------------------------
 # Индекс (singleton: грузим один раз, используем для всех сценариев)
@@ -168,12 +176,6 @@ def predict_scenario(
         # Опциональные сервисы: исключить remote_call к сервисам которые в этом
         # сценарии не использовались (нет food/insurance в booking шагах).
         # Предотвращает FP remote-рёбра к ts-food-service / ts-assurance-service.
-        _FOOD_MODS = frozenset({
-            "ts-food-service", "ts-food-delivery-service",
-            "ts-train-food-service", "ts-station-food-service",
-        })
-        _INS_MODS = frozenset({"ts-assurance-service"})
-        _CONSIGN_MODS = frozenset({"ts-consign-service"})
         _CONSIGN_STEP_TYPES = {"add_consign", "update_consign", "query_consign"}
         excluded_modules: frozenset[str] = frozenset()
         if not oracle.has_food:
