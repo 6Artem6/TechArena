@@ -295,16 +295,12 @@ def _get_executes_infra(index: Index) -> frozenset[str]:
     return _EXECUTES_INFRA_CACHE
 
 
+_PURE_UTILITY_CACHE: frozenset[str] | None = None
 _NON_ENTRY_MODULES_CACHE: frozenset[str] | None = None
 
 
 def _get_non_entry_modules(index: Index) -> frozenset[str]:
-    """Топологически: модули без HTTP entry points.
-
-    Эти модули (ts-common, ts-gateway-service, ...) не имеют @RequestMapping handlers
-    → содержат только shared utilities/entities/DTOs.
-    Определяется через граф-топологию скелета, без hardcode имён модулей.
-    """
+    """Топологически: модули без HTTP entry points."""
     global _NON_ENTRY_MODULES_CACHE
     if _NON_ENTRY_MODULES_CACHE is None:
         handler_mods = frozenset(
@@ -315,11 +311,33 @@ def _get_non_entry_modules(index: Index) -> frozenset[str]:
     return _NON_ENTRY_MODULES_CACHE
 
 
+def _get_pure_utility_modules(index: Index) -> frozenset[str]:
+    """Топологически: pure utility libs — без HTTP handlers И без входящих remote_call.
+
+    ts-common — типичный пример: shared DTOs/utils, не является REST-сервисом.
+    Методы из таких модулей с 0 исходящих calls — shallow getters/enums, безопасно убрать.
+    Более точный критерий чем _get_non_entry_modules: исключает сервисы без handlers
+    но вызываемые по REST (например ts-gateway-service может вызываться).
+    """
+    global _PURE_UTILITY_CACHE
+    if _PURE_UTILITY_CACHE is None:
+        non_entry = _get_non_entry_modules(index)
+        # Собрать модули которые являются targets remote_call
+        remote_target_mods: set[str] = set()
+        for targets in index.wiring.get("remote_call", {}).values():
+            for t in targets:
+                mod = index.module.get(t, "")
+                if mod:
+                    remote_target_mods.add(mod)
+        _PURE_UTILITY_CACHE = non_entry - frozenset(remote_target_mods)
+    return _PURE_UTILITY_CACHE
+
+
 def _is_shallow_method(nid: str, index: Index, non_entry_mods: frozenset[str]) -> bool:
-    """True если метод — shallow getter/enum/util из non-entry модуля.
+    """True если метод — shallow getter/enum/util из pure utility модуля.
 
     Топологический критерий (zero-hardcode):
-      - принадлежит модулю без HTTP handlers
+      - принадлежит pure utility модулю (без handlers, без incoming remote_call)
       - не конструктор (<init>)
       - 0 исходящих calls (простой getter, enum accessor, utility)
     """

@@ -798,11 +798,9 @@ def enhanced_ground(
                     _sv_ranked.append((_sv_sc, _sv_h))
             ranked = sorted(_sv_ranked, reverse=True)
 
-        # --- Hub rerank ---
-        # ОТКЛЮЧЕНО: gamma=0.10 → S3 0.802→0.671, S5 0.741→0.610 (FP flood)
-        # gamma=0.05 → S5 216→208 (ухудшение). Оставить отключённым.
-        # if _hub_reachable and ranked:
-        #     ranked = rerank_by_hub(ranked, _hub_reachable, gamma=0.10, top_k=50)
+        # --- Hub rerank: ОТКЛЮЧЕНО ---
+        # gamma=0.10 → S3 0.802→0.671, S5 0.741→0.610 (FP flood для search шагов).
+        # Для book шагов: preserve CrossEncoder gap слишком велик для hub boost (нужна gamma>>0.47).
 
         # view_trip с известным oracle.train_type: расширить tau-окно, чтобы travel service
         # попал в hs несмотря на высокий score preserve-service (vocabulary перекрытие в BGE-M3).
@@ -898,10 +896,8 @@ def enhanced_ground(
                         break
             hs = swapped
 
-        # Sibling addition: ОТКЛЮЧЕНО — S5 (D train) не требует G-sibling,
-        # но S2 (Other train) требует оба. Паттерн нестабилен без анализа gold.
-        # if step_info.step_type == "book" and effective_train_type in ("OTHER",) and hs:
-        #     ...добавить G-sibling...
+        # Sibling addition: ОТКЛЮЧЕНО — добавление G-side для D-train book ухудшает S2 и S5.
+        # Gold S2/S5 не включает G-side preserve: arch132449 +86 edges в S2 были FP.
 
         # action-шаги: предпочесть handler с именем, содержащим step_type
         # (cancelTicket, rebook.rebook, registerUser).

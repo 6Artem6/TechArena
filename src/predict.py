@@ -173,19 +173,15 @@ def predict_scenario(
         # oracle.train_type накоплен через parse_step в enhanced_ground
         train_type = oracle.train_type
 
-        # Опциональные сервисы: исключить remote_call к сервисам которые в этом
-        # сценарии не использовались (нет food/insurance в booking шагах).
-        # Предотвращает FP remote-рёбра к ts-food-service / ts-assurance-service.
-        _CONSIGN_STEP_TYPES = {"add_consign", "update_consign", "query_consign"}
+        # Опциональные сервисы: исключить remote_call если не заказано.
         excluded_modules: frozenset[str] = frozenset()
         if not oracle.has_food:
             excluded_modules = excluded_modules | _FOOD_MODS
         if not oracle.has_insurance:
             excluded_modules = excluded_modules | _INS_MODS
-        # Consign: exclude если нет explicit luggage и нет consign-шагов в истории.
-        # preserve-service BFS → createConsign только при actual luggage booking.
         _has_consign = oracle.has_luggage or any(
-            sr.step_type in _CONSIGN_STEP_TYPES for sr in oracle.step_history
+            s.step_type in ("add_consign", "update_consign", "query_consign")
+            for s in oracle.step_history
         )
         if not _has_consign:
             excluded_modules = excluded_modules | _CONSIGN_MODS
