@@ -612,8 +612,11 @@ def main() -> None:
         tok_pat = "|".join(t for t in all_toks if len(t) >= 4)
         if not tok_pat:
             continue
-        patterns[f"has_{pat_key}"] = tok_pat
-        patterns[f"no_{pat_key}"] = rf"(?:without|no)\s*(?:{tok_pat})"
+        # Strict has_* pattern: requires context word "with" or action verb.
+        # Bare token match (e.g. just "assurance") causes FP when the step mentions
+        # the feature negatively or in a generic context.
+        patterns[f"has_{pat_key}"] = rf"\bwith\b.{{0,80}}\b({tok_pat})\b"
+        patterns[f"no_{pat_key}"] = rf"\b(without|no)\b.{{0,80}}\b({tok_pat})\b"
     opt_patterns_path = cfg_cache_dir() / "optional_patterns.json"
     opt_patterns_path.write_text(json.dumps(patterns, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Сохранено: {opt_patterns_path}", file=sys.stderr)
