@@ -36,26 +36,25 @@ class StepRecord:
 # NOT_G имеет приоритет над G: предотвращает false positive "not high-speed".
 # ---------------------------------------------------------------------------
 
-def _build_re(key: str, default_alts: list[str]) -> re.Pattern[str]:
+def _build_re(key: str) -> re.Pattern[str]:
+    """Собрать regex из конфига (oracle_train_patterns[key]). Ошибка если ключа нет."""
     raw = cfg_get("oracle_train_patterns", {})
-    alts = raw.get(key, default_alts)
+    alts = raw.get(key)
+    if not alts:
+        raise ValueError(f"oracle_train_patterns.{key} не найден в domain_config.yaml")
     return re.compile(r"\b(" + "|".join(alts) + r")\b", re.I)
 
 
 def _build_not_g_re() -> re.Pattern[str]:
     raw = cfg_get("oracle_train_patterns", {})
-    alts = raw.get("NOT_G", [
-        r"not\s+high.?speed", r"regular\s+train", r"other\b.{0,30}\btype",
-    ])
+    alts = raw.get("NOT_G")
+    if not alts:
+        raise ValueError("oracle_train_patterns.NOT_G не найден в domain_config.yaml")
     return re.compile("|".join(alts), re.I)
 
 
-_TRAIN_G    = _build_re("G", [
-    r"high.?speed", r"g.train", r"g-?\s*type", r"gaotie", r"gao.?tie",
-])
-_TRAIN_D    = _build_re("D", [
-    r"d.train", r"d-?\s*type", r"dongche", r"dong.?che",
-])
+_TRAIN_G     = _build_re("G")
+_TRAIN_D     = _build_re("D")
 _TRAIN_NOT_G = _build_not_g_re()
 
 _SEAT_1ST = re.compile(r"\b(first.?class|business.?class|1st.?class)\b", re.I)

@@ -137,6 +137,10 @@ step_train_patterns:
     - 'non.?high.?speed'
     - 'slow'
     - 'normal\s+train'
+  NOT_G:
+    - 'not\s+high.?speed'
+    - 'regular\s+train'
+    - 'other\b.{0,30}\btype'
 
 # ---------------------------------------------------------------------------
 # Паттерны типа поезда — oracle.py

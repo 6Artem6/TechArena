@@ -32,28 +32,20 @@ _SAFE_KEYWORD_TYPES = frozenset({
 # В oracle.py DongChe — D-тип (разные роли!).
 # ---------------------------------------------------------------------------
 
-def _build_train_re(key: str, default_alts: list[str]) -> re.Pattern[str]:
-    """Собрать regex из списка альтернатив (из конфига или дефолта)."""
+def _build_train_re(key: str) -> re.Pattern[str]:
+    """Собрать regex из конфига (step_train_patterns[key]). Ошибка если ключа нет."""
     raw = cfg_get("step_train_patterns", {})
-    alts = raw.get(key, default_alts)
+    alts = raw.get(key)
+    if not alts:
+        raise ValueError(f"step_train_patterns.{key} не найден в domain_config.yaml")
     pattern = r"\b(" + "|".join(alts) + r")\b"
     return re.compile(pattern, re.I)
 
 
-_G_TRAIN = _build_train_re("G", [
-    r"high.?speed", r"gaotie", r"gao.?tie", r"g.?train", r"g-?\s*type",
-    r"dongche", r"dong.?che", r"d.?train", r"d-?\s*type", r"crh", r"bullet",
-])
-_OTHER_TRAIN = _build_train_re("OTHER", [
-    r"regular", r"'?other'?\s*type", r"non.?high.?speed", r"slow", r"normal\s+train",
-])
-
+_G_TRAIN     = _build_train_re("G")
+_OTHER_TRAIN = _build_train_re("OTHER")
 # NOT_G: отрицание high-speed — приоритет над _G_TRAIN (как в oracle.py)
-# Предотвращает false positive: "not high-speed" → train_type=G
-_NOT_G_TRAIN = re.compile(
-    r"(not\s+high.?speed|regular\s+train|other\b.{0,30}\btype)",
-    re.I,
-)
+_NOT_G_TRAIN = _build_train_re("NOT_G")
 
 _SEAT_FIRST  = re.compile(r"\b(first.?class|business.?class|1st.?class)\b", re.I)
 _SEAT_SECOND = re.compile(r"\b(second.?class|economy|2nd.?class|standard)\b", re.I)
