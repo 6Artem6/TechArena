@@ -83,104 +83,223 @@ def derive_func_variant_suffixes(modules: list[str], prefix: str, suffix: str) -
 
 
 # ---------------------------------------------------------------------------
-# Шаг 3: optional_service_groups — Qwen семантическая группировка
+# Шаг 3: optional_service_groups — кластеризация через теги паспортов
 # ---------------------------------------------------------------------------
 
-_GROUPING_SYSTEM = (
-    "You are a microservice architecture analyst.\n"
-    "Given a list of microservices, identify ALL services that implement\n"
-    "OPTIONAL booking features (features a user may or may not choose per booking).\n\n"
-    "Feature groups to find:\n"
-    "  food     — any food ordering service (train food, station food, delivery, food menu)\n"
-    "             synonyms in names: food, meal, dining\n"
-    "  insurance — any insurance/assurance service\n"
-    "             synonyms: insurance, assurance, coverage\n"
-    "  consign  — any luggage/consignment service\n"
-    "             synonyms: consign, consignment, luggage, baggage\n\n"
-    "Rules:\n"
-    "  - Include ALL services whose name contains a food/insurance/consign synonym.\n"
-    "  - 'assurance' is a synonym for 'insurance' — include ts-assurance-service under 'insurance'.\n"
-    "  - station-food and train-food are both food services — include them.\n"
-    "  - Use keys: food, insurance, consign.\n"
-    "  - Skip admin, auth, routing, order, payment, user, travel, seat, basic, security services.\n\n"
-    "Output ONLY valid JSON: {\"feature_key\": [\"service-name\", ...], ...}\n"
-    "No explanation, no markdown."
-)
+# Стоп-токены: слишком общие, не являются feature-специфичными
+_TAG_STOP = frozenset({
+    "management", "retrieval", "service", "system", "operations", "data",
+    "admin", "information", "handling", "specific", "creation", "deletion",
+    "update", "access", "train", "order", "booking", "route", "station",
+    "travel", "payment", "user", "ticket", "price", "seat", "cancel",
+    "rebook", "basic", "auth", "security", "common", "notify", "send",
+    "contact", "request", "lookup", "search", "query", "based", "list",
+    "name", "type", "details", "config", "processing", "other", "inside",
+    "record", "retrieve", "insert", "create", "delete", "batch",
+    "unique", "identifier", "existing", "available", "specific",
+})
+
+# Core первые-токены в именах сервисов → не передавать в Qwen как optional кандидаты
+# Проверяется только ПЕРВЫЙ токен нормализованного имени (prefix/suffix сняты)
+_CORE_NAME_TOKENS = frozenset({
+    "order", "travel", "route", "seat", "user", "auth", "security", "basic",
+    "admin", "payment", "cancel", "execute", "rebook", "notify", "station",
+    "train", "gateway", "config", "common", "wait", "inside", "preserve",
+    "contacts", "delivery", "notification", "verification",
+})
+
+# Сохраняется в project_config.json, используется в шаге 6 (optional_patterns.json)
+# Формат: {group_name: [synonym_tokens_for_regex]}
+# Для нового проекта — генерируется автоматически; fallback на пустой dict.
+_FEATURE_TOKENS: dict[str, list[str]] = {}  # заполняется derive_optional_groups_from_tags
 
 
-# Токены для детерминированного расширения (синонимы фич)
-_FEATURE_TOKENS: dict[str, list[str]] = {
-    "food":      ["food", "meal", "dining"],
-    "insurance": ["insurance", "assurance", "coverage"],
-    "consign":   ["consign", "luggage", "baggage"],
-}
+def _load_svc_tag_tokens(
+    modules: list[str], prefix: str, suffix: str
+) -> dict[str, set[str]]:
+    """Токены тегов из паспортов + токены из имени сервиса."""
+    from src._config import cfg_cache_dir
+    import pickle
+
+    svc_tokens: dict[str, set[str]] = {m: set() for m in modules}
+    sp_path = cfg_cache_dir() / "service_profiles_v2.pkl"
+    if sp_path.exists():
+        try:
+            data = pickle.load(open(sp_path, "rb"))
+            profs = data.get("profiles", data) if isinstance(data, dict) else data
+            for mod in modules:
+                if mod in profs:
+                    for tag in getattr(profs[mod], "tags", []):
+                        svc_tokens[mod].update(
+                            t for t in tag.split("-") if len(t) >= 4
+                        )
+        except Exception as e:
+            print(f"[WARN] service_profiles_v2.pkl: {e}", file=sys.stderr)
+    # Дополнить токенами из имени сервиса (надёжный fallback)
+    for mod in modules:
+        norm = mod.removeprefix(prefix).removesuffix(suffix)
+        svc_tokens[mod].update(p for p in norm.split("-") if len(p) >= 4)
+    return svc_tokens
 
 
-def _expand_groups_by_tokens(
-    groups: dict[str, list[str]],
+def _cluster_by_token_overlap(
+    svc_tokens: dict[str, set[str]], n_modules: int
+) -> dict[str, list[str]]:
+    """Детерминированная кластеризация: token → [services] при 2 ≤ count ≤ n//6."""
+    tok_svcs: dict[str, list[str]] = {}
+    for mod, tokens in svc_tokens.items():
+        for tok in tokens:
+            tok_svcs.setdefault(tok, []).append(mod)
+    max_count = max(4, n_modules // 6)
+    return {
+        tok: sorted(set(svcs))
+        for tok, svcs in tok_svcs.items()
+        if 2 <= len(svcs) <= max_count and tok not in _TAG_STOP
+    }
+
+
+def derive_optional_groups_from_tags(
     modules: list[str],
     prefix: str,
     suffix: str,
-) -> dict[str, list[str]]:
-    """Дополнить группы: добавить сервисы которые Qwen пропустил, но чьё имя содержит токен фичи."""
-    result = {k: list(v) for k, v in groups.items()}
-    for feature, tokens in _FEATURE_TOKENS.items():
-        existing = set(result.get(feature, []))
-        for m in modules:
-            if m in existing:
-                continue
-            norm = m.removeprefix(prefix).removesuffix(suffix)
-            parts = set(norm.split("-"))
-            if parts & set(tokens):
-                result.setdefault(feature, []).append(m)
-    return {k: sorted(v) for k, v in result.items() if v}
+    no_qwen: bool = False,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Кластеризовать сервисы по optional feature groups из тегов паспортов.
 
+    Returns:
+        groups         — {group_name: [service_names]}
+        tokens_per_grp — {group_name: [synonym_tokens]} для шага 6 (optional_patterns.json)
+    """
+    svc_tokens = _load_svc_tag_tokens(modules, prefix, suffix)
+    cluster_cands = _cluster_by_token_overlap(svc_tokens, len(modules))
 
-def derive_optional_groups_qwen(modules: list[str]) -> dict[str, list[str]]:
-    """Спросить Qwen: какие сервисы группируются по опциональным фичам."""
-    from src.localization.qwen_encoder import QwenEncoder, _CLASSIFY_SCHEMA
+    if no_qwen:
+        # Без Qwen: вернуть кандидаты как есть (возможны ложные группы)
+        tok_map = {tok: [tok] for tok in cluster_cands}
+        return dict(cluster_cands), tok_map
 
+    from src.localization.qwen_encoder import QwenEncoder
     enc = QwenEncoder()
     if not enc.enabled:
-        print("[WARN] Qwen недоступен — optional_service_groups не обновится", file=sys.stderr)
-        return {}
+        print("[WARN] Qwen недоступен — optional_service_groups: детерминированный fallback",
+              file=sys.stderr)
+        return dict(cluster_cands), {tok: [tok] for tok in cluster_cands}
 
-    services_str = "\n".join(f"  - {m}" for m in sorted(modules))
-    prompt = f"Microservices:\n{services_str}\n\nJSON:"
-
-    schema = {
+    module_set = set(modules)
+    arr_schema: dict = {"type": "array", "items": {"type": "string"}}
+    obj_schema: dict = {
         "type": "object",
-        "additionalProperties": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
+        "additionalProperties": {"type": "string"},
     }
-    system_prompt = _GROUPING_SYSTEM
 
+    # Qwen шаг 1: из кластеров выбрать optional addon feature groups
+    cand_keys = sorted(cluster_cands.keys())
+    cand_desc = "\n".join(
+        f"  {tok}: {cluster_cands[tok]}" for tok in cand_keys
+    )
+    prompt1 = (
+        f"Token clusters from microservice names/tags:\n{cand_desc}\n\n"
+        f"Which token keys represent OPTIONAL BOOKING ADDON features "
+        f"(things a passenger may ADD to a booking: food, insurance/assurance, luggage)?\n"
+        f"Skip infrastructure groups (auth, payment, order, route, config, preserve).\n"
+        f"Return ONLY a JSON array of token keys from the list above."
+    )
+    optional_tokens: list[str] = []
     try:
-        raw = enc._call_ollama(
-            prompt,
-            schema=schema,
-            system=system_prompt,
-            num_predict=300,
-            timeout=30,
-        )
-        if not isinstance(raw, dict):
-            print(f"[WARN] Qwen вернул неожиданный тип: {type(raw)}", file=sys.stderr)
-            return {}
-        # Фильтрация: оставить только реальные имена модулей
-        module_set = set(modules)
-        result: dict[str, list[str]] = {}
-        for key, svcs in raw.items():
-            if not isinstance(svcs, list):
-                continue
-            valid = [s for s in svcs if s in module_set]
-            if valid:
-                result[key] = valid
-        return result
+        raw1 = enc._call_ollama(prompt1, schema=arr_schema, num_predict=100, timeout=30)
+        if isinstance(raw1, list):
+            optional_tokens = [t for t in raw1 if t in set(cand_keys)]
+            print(f"  Qwen выбрал кластеры: {optional_tokens}", file=sys.stderr)
     except Exception as e:
-        print(f"[WARN] Qwen ошибка: {e}", file=sys.stderr)
-        return {}
+        print(f"[WARN] Qwen ошибка step1: {e}", file=sys.stderr)
+
+    groups: dict[str, list[str]] = {tok: cluster_cands[tok] for tok in optional_tokens}
+    clustered = {s for svcs in groups.values() for s in svcs}
+
+    # Qwen шаг 2: singletons батчами по 12 — classify unclustered services
+    # Отсеять core-сервисы по name-токенам перед передачей в Qwen
+    def _is_core(mod: str) -> bool:
+        norm = mod.removeprefix(prefix).removesuffix(suffix)
+        first = norm.split("-")[0]
+        # "travel2".startswith("travel") → core; "consign-price" → first="consign" → not core
+        return any(first == tok or first.startswith(tok) for tok in _CORE_NAME_TOKENS)
+
+    singletons = [m for m in sorted(modules) if m not in clustered and not _is_core(m)]
+    batch_size = 12
+    for i in range(0, len(singletons), batch_size):
+        batch = singletons[i: i + batch_size]
+        svc_desc = "\n".join(
+            f"  {m}: {sorted(svc_tokens.get(m, []))[:4]}"
+            for m in batch
+        )
+        prompt2 = (
+            f"Classify these microservices — are they optional booking addons?\n{svc_desc}\n\n"
+            f"Optional addons: things passengers add voluntarily (food ordering, "
+            f"insurance/assurance, luggage consignment). NOT core booking infrastructure.\n"
+            f"For each optional service assign a short group name (e.g. 'food', 'insurance', 'consign').\n"
+            f"Skip core services entirely.\n"
+            f"Return ONLY JSON: {{\"service-name\": \"group-name\", ...}}"
+        )
+        try:
+            raw2 = enc._call_ollama(prompt2, schema=obj_schema, num_predict=200, timeout=30)
+            if isinstance(raw2, dict):
+                for svc, grp in raw2.items():
+                    if svc in module_set and grp and isinstance(grp, str):
+                        groups.setdefault(grp, []).append(svc)
+                        print(f"  singleton → {svc}: group={grp}", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] Qwen ошибка step2 batch {i}: {e}", file=sys.stderr)
+
+    # Нормализовать
+    groups = {k: sorted(set(v)) for k, v in groups.items() if v}
+
+    # Детерминированный expand: добавить незахваченные сервисы чьё имя содержит
+    # ПЕРЕСЕЧЕНИЕ name-токенов существующих членов группы (строгий критерий).
+    captured = {s for svcs in groups.values() for s in svcs}
+    for grp in list(groups.keys()):
+        # Общие токены: intersection всех name-токенов текущих членов + group_name
+        member_tok_sets = []
+        for svc in groups[grp]:
+            norm = svc.removeprefix(prefix).removesuffix(suffix)
+            member_tok_sets.append({p for p in norm.split("-") if len(p) >= 4})
+        if not member_tok_sets:
+            continue
+        shared = member_tok_sets[0].copy()
+        for s in member_tok_sets[1:]:
+            shared &= s
+        shared.add(grp)  # group_name всегда в expand-ключах
+        shared -= _TAG_STOP
+        if not shared:
+            continue
+        for m in modules:
+            if m in captured:
+                continue
+            norm = m.removeprefix(prefix).removesuffix(suffix)
+            m_toks = {p for p in norm.split("-") if len(p) >= 4}
+            if m_toks & shared:
+                groups[grp].append(m)
+                captured.add(m)
+                print(f"  expand → {m}: group={grp} (via {m_toks & shared})", file=sys.stderr)
+    groups = {k: sorted(set(v)) for k, v in groups.items() if v}
+
+    # tokens_per_grp: intersection name-токенов членов группы + group_name.
+    # Intersection гарантирует специфичность: для food {food,delivery}∩{food}∩{station,food} = {food}.
+    tokens_per_grp: dict[str, list[str]] = {}
+    for grp, svcs in groups.items():
+        member_toks = []
+        for svc in svcs:
+            norm = svc.removeprefix(prefix).removesuffix(suffix)
+            member_toks.append({p for p in norm.split("-") if len(p) >= 4 and p not in _TAG_STOP})
+        if member_toks:
+            shared = member_toks[0].copy()
+            for s in member_toks[1:]:
+                shared &= s
+        else:
+            shared = set()
+        shared.add(grp)  # group_name always included
+        tokens_per_grp[grp] = sorted(shared)
+
+    return groups, tokens_per_grp
 
 
 # ---------------------------------------------------------------------------
@@ -411,18 +530,16 @@ def main() -> None:
     suffixes = derive_func_variant_suffixes(modules, naming["prefix"], naming["suffix"])
     print(f"func_variant_suffixes: {suffixes}", file=sys.stderr)
 
-    # Шаг 3: optional_service_groups
-    if args.no_qwen:
-        opt_groups: dict[str, list[str]] = {}
-        print("Qwen-этап пропущен (--no-qwen)", file=sys.stderr)
+    # Шаг 3: optional_service_groups — кластеризация через теги паспортов
+    print("Кластеризую optional_service_groups из тегов...", file=sys.stderr)
+    opt_groups, opt_tokens_per_grp = derive_optional_groups_from_tags(
+        modules, naming["prefix"], naming["suffix"], no_qwen=args.no_qwen
+    )
+    if opt_groups:
+        for key, svcs in sorted(opt_groups.items()):
+            print(f"  {key}: {svcs}", file=sys.stderr)
     else:
-        print("Запрашиваю Qwen для optional_service_groups...", file=sys.stderr)
-        opt_groups = derive_optional_groups_qwen(modules)
-        if opt_groups:
-            for key, svcs in sorted(opt_groups.items()):
-                print(f"  {key}: {svcs}", file=sys.stderr)
-        else:
-            print("  Qwen не вернул групп", file=sys.stderr)
+        print("  Групп не найдено", file=sys.stderr)
 
     # Шаг 4: tier2_arch_tokens
     domain_tokens = _extract_domain_tokens(modules, naming["prefix"], naming["suffix"])
@@ -451,13 +568,10 @@ def main() -> None:
         "service_naming": naming,
         "func_variant_suffixes": suffixes,
     }
-    # Детерминированное расширение: добавить сервисы пропущенные Qwen по token-matching
-    opt_groups = _expand_groups_by_tokens(opt_groups, modules, naming["prefix"], naming["suffix"])
     if opt_groups:
-        print("После расширения:", file=sys.stderr)
-        for key, svcs in sorted(opt_groups.items()):
-            print(f"  {key}: {svcs}", file=sys.stderr)
         config["optional_service_groups"] = opt_groups
+        # optional_feature_tokens сохраняем для шага 6 (optional_patterns.json)
+        config["optional_feature_tokens"] = opt_tokens_per_grp
     if arch_tokens:
         config["tier2_arch_tokens"] = arch_tokens
     if remote_tokens:
@@ -472,21 +586,34 @@ def main() -> None:
     print(json.dumps(config, ensure_ascii=False, indent=2))
 
     # Шаг 6: optional_patterns.json — regex для has_*/no_* ключей (step_typer.py)
-    # Детерминированно из _FEATURE_TOKENS; no_* = "without|no" + те же токены
-    # consign → luggage: step_typer ожидает ключ "luggage"
-    _FEATURE_TO_PATTERN_KEY: dict[str, str] = {
-        "food": "food", "insurance": "insurance", "consign": "luggage",
-    }
-    _FEATURE_TOKENS_EXT: dict[str, list[str]] = {
-        **_FEATURE_TOKENS,
-        "consign": sorted(set(_FEATURE_TOKENS["consign"]) | {"luggage"}),
+    # Источник токенов: opt_tokens_per_grp (из тегов паспортов + имён сервисов).
+    # step_typer.py ожидает ключи: has_food, no_food, has_insurance, no_insurance,
+    #   has_luggage, no_luggage (старый API: consign → luggage).
+    # Маппинг group_name → pattern_key определяется по overlap токенов.
+    _KNOWN_PATTERN_KEYS = {
+        "food": "food", "meal": "food", "dining": "food",
+        "insurance": "insurance", "assurance": "insurance", "coverage": "insurance",
+        "consign": "luggage", "consignment": "luggage", "luggage": "luggage", "baggage": "luggage",
     }
     patterns: dict[str, str] = {}
-    for feature, tokens in _FEATURE_TOKENS_EXT.items():
-        key = _FEATURE_TO_PATTERN_KEY.get(feature, feature)
-        tok_pat = "|".join(tokens)
-        patterns[f"has_{key}"] = tok_pat
-        patterns[f"no_{key}"] = rf"(?:without|no)\s*(?:{tok_pat})"
+    for grp, tokens in opt_tokens_per_grp.items():
+        # Определить pattern_key: первый токен группы совпадающий с известным маппингом
+        pat_key = _KNOWN_PATTERN_KEYS.get(grp)
+        if pat_key is None:
+            for tok in tokens:
+                if tok in _KNOWN_PATTERN_KEYS:
+                    pat_key = _KNOWN_PATTERN_KEYS[tok]
+                    break
+        if pat_key is None:
+            pat_key = grp  # fallback: group_name as-is
+        # Добавить все синонимы pat_key из маппинга (luggage/baggage для consign)
+        synonyms = {t for t, k in _KNOWN_PATTERN_KEYS.items() if k == pat_key and len(t) >= 4}
+        all_toks = sorted(set(tokens) | synonyms)
+        tok_pat = "|".join(t for t in all_toks if len(t) >= 4)
+        if not tok_pat:
+            continue
+        patterns[f"has_{pat_key}"] = tok_pat
+        patterns[f"no_{pat_key}"] = rf"(?:without|no)\s*(?:{tok_pat})"
     opt_patterns_path = cfg_cache_dir() / "optional_patterns.json"
     opt_patterns_path.write_text(json.dumps(patterns, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Сохранено: {opt_patterns_path}", file=sys.stderr)
