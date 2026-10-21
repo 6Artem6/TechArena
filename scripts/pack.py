@@ -197,6 +197,7 @@ CACHE_FILES: list[str] = [
     "cache/ce_scores_cache.pkl",
     "cache/fsm_transitions.json",
     "cache/sibling_metadata.json",
+    "cache/optional_patterns.json",
     _sp_cache_filename(),
 ]
 
