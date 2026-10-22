@@ -450,6 +450,15 @@ complex_token_rules:
 
 # Шумные токены при поиске auth/security кандидатов (gen_project_config.py)
 # Generic HTTP / config / bootstrap слова — не связаны с auth-логикой
+# Описания optional service groups для classify_step() system prompt.
+# Ключи = group names из project_config.json:optional_service_groups.
+# Значения — строки которые вставляются в services поле промпта.
+# Для нового проекта: дополнить group names с их описаниями.
+classify_service_descriptions:
+  food: "food_train (food on the train), food_station (food at the station)"
+  insurance: "insurance/assurance (travel protection)"
+  consign: "luggage/consign (baggage handling)"
+
 auth_namespace_noise:
   - cors
   - configure

@@ -160,8 +160,17 @@ _CLASSIFY_SCHEMA = {
     ],
 }
 
-_CLASSIFY_SYSTEM = (
-    "You are a train ticket system action classifier.\n"
+# =============================================================================
+# classify_step() system prompt — две части: шаблон и builder
+# =============================================================================
+
+# ── Вручную ──────────────────────────────────────────────────────────────────
+# Всё что зависит от доменного знания и не выводится из скелета автоматически:
+# step_type список, train_type/seat_class ЖД-семантика, payment/search/role поля,
+# RULES и примеры.  {system_name} и {services_block} — плейсхолдеры для builder.
+
+_CLASSIFY_SYSTEM_TEMPLATE = (
+    "You are a {system_name} action classifier.\n"
     "Extract these fields from the user action text:\n\n"
     "step_type: ONE of: login, register, book, pay, cancel, rebook, collect,\n"
     "  search_train, search_advanced, search_transit, view_trip, query_orders,\n"
@@ -171,9 +180,7 @@ _CLASSIFY_SYSTEM = (
     "train_type: \"G\" (high-speed/bullet/gaotie/CRH/DongChe/D-type), "
     "\"OTHER\" (regular/slow/non-high-speed), \"\" (unknown)\n"
     "seat_class: \"FIRST\" (first-class/business), \"SECOND\" (second-class/economy), \"\" (unknown)\n"
-    "services: list ONLY explicitly mentioned services:\n"
-    "  food_train (food on the train), food_station (food at the station),\n"
-    "  insurance/assurance, luggage/consign — each as {name, present:true/false}\n"
+    "{services_block}\n"
     "payment_mode: \"internal\" (internal balance), \"external\" (external service/balance empty), \"\" (unknown)\n"
     "search_criteria: mention any of: cheapest, quickest, fewest_stops, transfer\n"
     "order_filter: \"status:Paid\", \"status:Cancel\", \"date:travel\", \"date:purchase\", or \"\"\n"
@@ -212,6 +219,70 @@ _CLASSIFY_SYSTEM = (
     '"keywords":[]}\n'
     "Output ONLY valid JSON. No other text."
 )
+
+# ── Собирается: services block из project_config.json ────────────────────────
+# optional_service_groups → какие optional services есть в этом проекте.
+# Описания из domain_config.yaml:classify_service_descriptions (вручную, краткий словарь).
+# Если группа не в словаре → используется group_name as-is.
+
+_SERVICES_BLOCK_FALLBACK = (
+    "services: list ONLY explicitly mentioned services:\n"
+    "  food_train (food on the train), food_station (food at the station),\n"
+    "  insurance/assurance, luggage/consign — each as {name, present:true/false}"
+)
+
+
+def _build_services_block(optional_groups: dict) -> str:
+    """services поле — из project_config.json:optional_service_groups.
+
+    Описания берутся из domain_config.yaml:classify_service_descriptions.
+    Если кеш недоступен → возвращает hardcoded fallback.
+    """
+    if not optional_groups:
+        return _SERVICES_BLOCK_FALLBACK
+
+    try:
+        from src._config import cfg_get as _cfg_get
+        descs: dict = _cfg_get("classify_service_descriptions", {})
+    except Exception:
+        descs = {}
+
+    lines: list[str] = []
+    for group in sorted(optional_groups):
+        desc = descs.get(group, f"{group} service")
+        lines.append(f"  {desc}")
+
+    services_str = ",\n".join(lines)
+    return (
+        f"services: list ONLY explicitly mentioned services:\n"
+        f"{services_str}\n"
+        f"  — each as {{name, present:true/false}}"
+    )
+
+
+def _build_classify_system(domain_context: str, optional_groups: dict) -> str:
+    """Собрать системный промпт classify_step() из двух частей:
+
+    1. domain_context (из project_passport.json) — system name + features
+    2. _CLASSIFY_SYSTEM_TEMPLATE (вручную) — поля, rules, examples
+       с {services_block} заполненным из optional_service_groups
+    """
+    # system_name: "Travel Management System" → "Travel Management System"
+    system_name = "microservice"
+    if domain_context:
+        raw = domain_context.split("System context:")[-1].split(".")[0].strip()
+        if raw:
+            system_name = raw
+
+    services_block = _build_services_block(optional_groups)
+
+    body = (
+        _CLASSIFY_SYSTEM_TEMPLATE
+        .replace("{system_name}", system_name)
+        .replace("{services_block}", services_block)
+    )
+
+    return (f"{domain_context}\n\n" + body) if domain_context else body
 
 _CLASSIFY_NUM_PREDICT = 200  # полный StepParams JSON ~60-120 токенов
 
@@ -310,8 +381,25 @@ class QwenEncoder:
         self._language = _detect_language(targets_root)
         self._system, self._user_tmpl = _build_prompts(self._language)
         self._domain_context = self._load_domain_context()
+        self._classify_system = _build_classify_system(
+            self._domain_context,
+            self._load_optional_groups(),
+        )
         self._backend, self.enabled = self._init_backend()
         self._cache_dirty = False
+
+    @staticmethod
+    def _load_optional_groups() -> dict:
+        """Загрузить optional_service_groups из project_config.json."""
+        try:
+            from src._config import cfg_cache_dir
+            pc_path = cfg_cache_dir() / "project_config.json"
+            if pc_path.exists():
+                data = json.loads(pc_path.read_text(encoding="utf-8"))
+                return data.get("optional_service_groups", {})
+        except Exception:
+            pass
+        return {}
 
     @staticmethod
     def _load_domain_context() -> str:
@@ -528,16 +616,12 @@ class QwenEncoder:
             return StepParams()
 
         prompt = f'Action: "{action}"\n\nJSON:'
-        classify_system = (
-            (self._domain_context + "\n\n" + _CLASSIFY_SYSTEM)
-            if self._domain_context else _CLASSIFY_SYSTEM
-        )
         try:
             if self._backend == "ollama":
                 raw = self._call_ollama(
                     prompt,
                     schema=_CLASSIFY_SCHEMA,
-                    system=classify_system,
+                    system=self._classify_system,
                     num_predict=_CLASSIFY_NUM_PREDICT,
                 )
             elif self._backend == "transformers":
