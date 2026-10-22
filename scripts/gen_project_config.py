@@ -24,7 +24,7 @@ import json
 import os
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -124,10 +124,14 @@ def derive_high_freq_tokens(
 def derive_core_name_tokens(
     modules: list[str], prefix: str, suffix: str
 ) -> frozenset[str]:
-    """Первые токены нормализованных имён сервисов, встречающиеся у >1 модуля.
+    """Первые токены нормализованных имён сервисов, встречающиеся у ≥3 модулей.
 
-    Эти токены являются core-сервисами проекта (order, travel, station, …),
-    а не optional addon feature groups.
+    Эти токены являются core-сервисами проекта (admin, …).
+    Порог ≥3 намеренно исключает optional addon пары (food×2, consign×2)
+    которые имеют только 2 варианта (base + functional-extension).
+    Core G/OTHER пары (order-service / order-other-service) тоже count=2
+    → они не попадают в core_name_toks, но Qwen их отсеивает в optional-filter
+    т.к. они не являются "optional booking addons".
     """
     first_tok_count: Counter[str] = Counter()
     for mod in modules:
@@ -135,7 +139,7 @@ def derive_core_name_tokens(
         first = norm.split("-")[0]
         if len(first) >= 4:
             first_tok_count[first] += 1
-    return frozenset(tok for tok, cnt in first_tok_count.items() if cnt > 1)
+    return frozenset(tok for tok, cnt in first_tok_count.items() if cnt >= 3)
 
 # Сохраняется в project_config.json, используется в шаге 6 (optional_patterns.json)
 # Формат: {group_name: [synonym_tokens_for_regex]}
@@ -187,11 +191,46 @@ def _cluster_by_token_overlap(
     }
 
 
+# Seed keywords для optional addon categories — используются для singleton pre-filter.
+# Минимальный хардкод: только 3 известных addon типа. Actual keyword extraction —
+# из имён методов/DTO в скелете через _has_optional_keyword_in_skeleton().
+_OPTIONAL_SEED_KEYWORDS = frozenset({
+    "food", "meal", "dining", "catering",
+    "insurance", "assurance", "protection",
+    "consign", "consignment", "luggage", "baggage",
+})
+
+
+def _has_optional_keyword_in_skeleton(sk: dict, module: str) -> bool:
+    """True если сервис имеет методы/DTO/пути с optional addon keyword.
+
+    Portable: ищет в именах методов и классов из скелета (не hardcoded сервисы).
+    Фильтрует SecurityConfig/Application классы (только config/application suffix).
+    """
+    for node in sk["nodes"].values():
+        if node.get("module") != module:
+            continue
+        kind = node.get("kind", "")
+        if kind not in ("method", "type", "endpoint", "field"):
+            continue
+        # Пропустить bootstrap и config классы
+        fqn = node.get("fqn", "").lower()
+        if fqn.endswith(("application", "config", "configuration", "securityconfig")):
+            continue
+        for field in ("name", "fqn", "url"):
+            val = node.get(field, "").lower()
+            for kw in _OPTIONAL_SEED_KEYWORDS:
+                if kw in val:
+                    return True
+    return False
+
+
 def derive_optional_groups_from_tags(
     modules: list[str],
     prefix: str,
     suffix: str,
     no_qwen: bool = False,
+    sk: dict | None = None,
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """Кластеризовать сервисы по optional feature groups из тегов паспортов.
 
@@ -228,6 +267,14 @@ def derive_optional_groups_from_tags(
         "additionalProperties": {"type": "string"},
     }
 
+    # Детерминированный pre-filter: сервисы с "-other" вариантом = core G/OTHER pairs
+    norm_set_inner = {m.removeprefix(prefix).removesuffix(suffix) for m in modules}
+    other_pair_first: set[str] = set()
+    for m in modules:
+        norm = m.removeprefix(prefix).removesuffix(suffix)
+        if norm + "-other" in norm_set_inner:
+            other_pair_first.add(norm.split("-")[0])
+
     # Qwen шаг 1: из кластеров выбрать optional addon feature groups
     cand_keys = sorted(cluster_cands.keys())
     cand_desc = "\n".join(
@@ -235,9 +282,13 @@ def derive_optional_groups_from_tags(
     )
     prompt1 = (
         f"Token clusters from microservice names/tags:\n{cand_desc}\n\n"
-        f"Which token keys represent OPTIONAL BOOKING ADDON features "
-        f"(things a passenger may ADD to a booking: food, insurance/assurance, luggage)?\n"
-        f"Skip infrastructure groups (auth, payment, order, route, config, preserve).\n"
+        f"Select token keys that represent OPTIONAL BOOKING ADDON features.\n"
+        f"There are exactly 3 types of optional addons passengers may add to a ticket:\n"
+        f"  1. FOOD/MEAL: food ordering, dining (keywords: food, meal, dining)\n"
+        f"  2. INSURANCE/ASSURANCE: travel protection (keywords: insurance, assurance)\n"
+        f"  3. LUGGAGE/CONSIGNMENT: baggage handling (keywords: consign, consignment, luggage)\n"
+        f"Select ONLY clusters matching these 3 types. "
+        f"SKIP: auth, payment, order, route, config, preserve, booking, station, travel.\n"
         f"Return ONLY a JSON array of token keys from the list above."
     )
     optional_tokens: list[str] = []
@@ -252,18 +303,27 @@ def derive_optional_groups_from_tags(
     groups: dict[str, list[str]] = {tok: cluster_cands[tok] for tok in optional_tokens}
     clustered = {s for svcs in groups.values() for s in svcs}
 
-    # Qwen шаг 2: singletons батчами по 12 — classify unclustered services
-    # Отсеять core-сервисы по динамически вычисленным core-токенам.
-    all_core_toks = core_name_toks | _CORE_INFRA_TOKENS
+    # Qwen шаг 2: singletons — только сервисы НЕ в кластерах и НЕ core
+    # Core: infra tokens + G/OTHER pairs + high-freq name tokens
+    all_core_toks = core_name_toks | _CORE_INFRA_TOKENS | other_pair_first
 
     def _is_core(mod: str) -> bool:
         norm = mod.removeprefix(prefix).removesuffix(suffix)
         first = norm.split("-")[0]
-        # "travel2".startswith("travel") → core; "consign-price" → first="consign" → not core
         return any(first == tok or first.startswith(tok) for tok in all_core_toks)
 
-    singletons = [m for m in sorted(modules) if m not in clustered and not _is_core(m)]
-    batch_size = 12
+    # Дополнительный фильтр: только сервисы у которых keyword match в методах/DTO/именах
+    # с известными optional addon categories — portable search из скелета.
+    if sk is not None:
+        singletons = [
+            m for m in sorted(modules)
+            if m not in clustered
+            and not _is_core(m)
+            and _has_optional_keyword_in_skeleton(sk, m)
+        ]
+    else:
+        singletons = [m for m in sorted(modules) if m not in clustered and not _is_core(m)]
+    batch_size = 8
     for i in range(0, len(singletons), batch_size):
         batch = singletons[i: i + batch_size]
         svc_desc = "\n".join(
@@ -271,12 +331,14 @@ def derive_optional_groups_from_tags(
             for m in batch
         )
         prompt2 = (
-            f"Classify these microservices — are they optional booking addons?\n{svc_desc}\n\n"
-            f"Optional addons: things passengers add voluntarily (food ordering, "
-            f"insurance/assurance, luggage consignment). NOT core booking infrastructure.\n"
-            f"For each optional service assign a short group name (e.g. 'food', 'insurance', 'consign').\n"
-            f"Skip core services entirely.\n"
-            f"Return ONLY JSON: {{\"service-name\": \"group-name\", ...}}"
+            f"Classify these microservices as optional booking addons (yes/no + group).\n"
+            f"{svc_desc}\n\n"
+            f"Optional addons are things passengers add VOLUNTARILY:\n"
+            f"  food/meal → group 'food'\n"
+            f"  insurance/assurance → group 'insurance'\n"
+            f"  luggage/consignment → group 'consign'\n"
+            f"SKIP core infrastructure (station, route, train, seat, user, cancel, rebook).\n"
+            f"Return ONLY JSON for OPTIONAL services: {{\"service-name\": \"group-name\"}}"
         )
         try:
             raw2 = enc._call_ollama(prompt2, schema=obj_schema, num_predict=200, timeout=30)
@@ -418,6 +480,36 @@ _ARCH_TOKEN_WHITELIST = frozenset({
 })
 
 
+def _extract_arch_suffix_candidates(sk: dict, modules: list[str]) -> list[str]:
+    """Суффиксы camelCase имён классов встречающиеся в >= 20% модулей → arch candidates.
+
+    Portable: работает без хардкода доменных слов — суффиксы из скелета конкретного проекта.
+    Суффиксы по N сервисам (не просто count) устойчивее к диспропорциям размера сервисов.
+    """
+    svc_has: defaultdict[str, set[str]] = defaultdict(set)
+    for node in sk["nodes"].values():
+        if node.get("kind") not in ("type", "class", "interface"):
+            continue
+        fqn = node.get("fqn", "")
+        cls = fqn.rsplit(".", 1)[-1] if "." in fqn else fqn
+        if "$" in cls:
+            continue
+        parts = re.sub(r"([a-z])([A-Z])", r"\1 \2", cls).split()
+        if not parts:
+            continue
+        suf = parts[-1].lower()
+        if len(suf) < 3:
+            continue
+        mod = node.get("module", "")
+        if mod:
+            svc_has[suf].add(mod)
+    threshold = max(3, len(modules) * 0.20)
+    return [
+        suf for suf, svcs in sorted(svc_has.items(), key=lambda x: -len(x[1]))
+        if len(svcs) >= threshold
+    ]
+
+
 def derive_tier2_arch_tokens(sk: dict, domain_tokens: set[str], no_qwen: bool) -> list[str]:
     # Все токены из имён классов скелета
     all_class_tokens = set(_extract_class_tokens(sk, top_n=300))
@@ -427,11 +519,14 @@ def derive_tier2_arch_tokens(sk: dict, domain_tokens: set[str], no_qwen: bool) -
     if no_qwen:
         return base
 
-    # Кандидаты для Qwen-расширения: частые токены вне whitelist и не доменные
+    # Кандидаты для Qwen-расширения: суффиксы классов в >= 20% сервисов, не в whitelist
+    # Суффиксы точнее отражают архитектурные паттерны (ServiceImpl → impl) чем все токены
+    modules_list = sorted({n.get("module", "") for n in sk["nodes"].values() if n.get("module")})
+    arch_suffix_cands = _extract_arch_suffix_candidates(sk, modules_list)
     extra_cands = [
-        t for t in _extract_class_tokens(sk, top_n=80)
+        t for t in arch_suffix_cands
         if t not in _ARCH_TOKEN_WHITELIST and t not in domain_tokens
-    ][:20]
+    ][:15]
 
     if not extra_cands:
         return base
@@ -476,6 +571,42 @@ _AUTH_TOKEN_WHITELIST = frozenset({
 })
 
 
+def _extract_auth_namespace_candidates(
+    sk: dict, domain_tokens: set[str]
+) -> list[str]:
+    """Токены методов из auth/security/verif* сервисных узлов → кандидаты tier4.
+
+    Portable: вместо namespace_filter="security" (только имя пакета) ищет по модулю,
+    что захватывает auth- и verification- сервисы независимо от их package structure.
+    """
+    auth_mods: set[str] = set()
+    all_modules = {n.get("module", "") for n in sk["nodes"].values() if n.get("module")}
+    for mod in all_modules:
+        low = mod.lower()
+        if any(kw in low for kw in ("auth", "security", "verif", "jwt")):
+            auth_mods.add(mod)
+
+    _noise = frozenset({
+        "cors", "configure", "mapping", "configurer", "get", "add",
+        "find", "create", "delete", "all", "non", "default", "main",
+        "rest", "template", "rand", "color", "image", "cookie",
+    })
+    counts: Counter[str] = Counter()
+    for node in sk["nodes"].values():
+        if node.get("kind") != "method":
+            continue
+        mod = node.get("module", "")
+        if mod not in auth_mods:
+            continue
+        name = node.get("name", "")
+        if "<" in name:
+            continue
+        for tok in _tokenize_camel(name):
+            if tok not in domain_tokens and tok not in _noise:
+                counts[tok] += 1
+    return [tok for tok, _ in counts.most_common(20)]
+
+
 def derive_tier4_remote_tokens(sk: dict, language: str, no_qwen: bool) -> list[str]:
     # Все токены из имён классов и методов скелета
     all_class = set(_extract_class_tokens(sk, top_n=500))
@@ -487,14 +618,13 @@ def derive_tier4_remote_tokens(sk: dict, language: str, no_qwen: bool) -> list[s
     if no_qwen:
         return base or sorted(_AUTH_TOKEN_WHITELIST)
 
-    # Кандидаты для Qwen-расширения: security/auth namespace токены вне whitelist
-    sec = _extract_method_tokens(sk, top_n=60, namespace_filter="security")
-    auth = _extract_method_tokens(sk, top_n=60, namespace_filter="auth")
-    _exclude = {"cors", "configure", "mapping", "configurer", "get", "add",
-                "find", "create", "delete", "all", "non", "default"}
+    # Кандидаты для Qwen-расширения: токены методов из auth/security/verif сервисов
+    # Используем _extract_auth_namespace_candidates для portable поиска по модулям
+    domain_tokens = {n.get("module", "").removeprefix("ts-").removesuffix("-service")
+                     .replace("-", "_") for n in sk["nodes"].values() if n.get("module")}
     extra_cands = [
-        t for t in sec + auth
-        if t not in _AUTH_TOKEN_WHITELIST and t not in _exclude
+        t for t in _extract_auth_namespace_candidates(sk, domain_tokens)
+        if t not in _AUTH_TOKEN_WHITELIST
     ][:15]
 
     if not extra_cands:
@@ -571,7 +701,7 @@ def main() -> None:
     # Шаг 3: optional_service_groups — кластеризация через теги паспортов
     print("Кластеризую optional_service_groups из тегов...", file=sys.stderr)
     opt_groups, opt_tokens_per_grp = derive_optional_groups_from_tags(
-        modules, naming["prefix"], naming["suffix"], no_qwen=args.no_qwen
+        modules, naming["prefix"], naming["suffix"], no_qwen=args.no_qwen, sk=sk
     )
     if opt_groups:
         for key, svcs in sorted(opt_groups.items()):
