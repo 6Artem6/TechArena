@@ -502,6 +502,9 @@ domain_attributes_schema:
   search_criteria:
     description: "Search optimization criteria (comma-separated if multiple)"
     allowed_values: [cheapest, quickest, fewest_stops, transfer]
+  order_filter:
+    description: "Filter for order queries"
+    allowed_values: ['"status:Paid"', '"status:Cancel"', '"date:travel"', '"date:purchase"', '""']
 
 # Схема features: optional addons/modifiers (заменяет classify_service_descriptions)
 # Только те, что реально используются в проекте (из optional_service_groups)
@@ -519,24 +522,25 @@ domain_features_schema:
 domain_specific_rules:
   - "search_transit = ONLY when transfer/connection/via/layover explicitly mentioned"
   - "search_advanced = cheapest/quickest/fewest-stops (no transfer)"
-  - "features: omit unmentioned items (keep array short)"
-  - "attributes: omit keys with empty/unknown values"
+  - "services: omit unmentioned services (keep array short)"
+  - "train_type/seat_class/payment_mode: use \"\" when unknown"
   - "keywords: for pay add payment signal; for book add seat/service signals; skip for search"
 
-# Few-shot примеры для промпта (JSON-строки внутри одинарных кавычек YAML)
+# Few-shot примеры для промпта (flat JSON формат — простой для Qwen 3B)
+# from_raw() конвертирует → AgnosticStepParams.attributes/features при парсинге
 few_shot_examples:
   - input: "book first-class with food on train and insurance"
-    json_output: '{"step_type":"book","actor_role":"passenger","keywords":["first class","food","insurance"],"attributes":{"seat_class":"FIRST"},"features":[{"name":"food_train","state":true},{"name":"insurance","state":true}],"search_filters":[]}'
+    json_output: '{"step_type":"book","train_type":"","seat_class":"FIRST","services":[{"name":"food_train","present":true},{"name":"insurance","present":true}],"payment_mode":"","search_criteria":[],"order_filter":"","actor_role":"passenger","keywords":["first class","food","insurance"]}'
   - input: "pay using internal account balance"
-    json_output: '{"step_type":"pay","actor_role":"","keywords":["inside"],"attributes":{"payment_mode":"internal"},"features":[],"search_filters":[]}'
+    json_output: '{"step_type":"pay","train_type":"","seat_class":"","services":[],"payment_mode":"internal","search_criteria":[],"order_filter":"","actor_role":"","keywords":["inside"]}'
   - input: "pay using external payment service"
-    json_output: '{"step_type":"pay","actor_role":"","keywords":["payment","service"],"attributes":{"payment_mode":"external"},"features":[],"search_filters":[]}'
+    json_output: '{"step_type":"pay","train_type":"","seat_class":"","services":[],"payment_mode":"external","search_criteria":[],"order_filter":"","actor_role":"","keywords":["payment","service"]}'
   - input: "advanced search: cheapest G-train trips"
-    json_output: '{"step_type":"search_advanced","actor_role":"","keywords":[],"attributes":{"train_type":"G","search_criteria":"cheapest"},"features":[],"search_filters":[]}'
+    json_output: '{"step_type":"search_advanced","train_type":"G","seat_class":"","services":[],"payment_mode":"","search_criteria":["cheapest"],"order_filter":"","actor_role":"","keywords":[]}'
   - input: "ask for trips with a transfer via Suzhou"
-    json_output: '{"step_type":"search_transit","actor_role":"","keywords":["transfer"],"attributes":{"search_criteria":"transfer"},"features":[],"search_filters":[]}'
+    json_output: '{"step_type":"search_transit","train_type":"","seat_class":"","services":[],"payment_mode":"","search_criteria":["transfer"],"order_filter":"","actor_role":"","keywords":["transfer"]}'
   - input: "query G-train orders (status: Paid)"
-    json_output: '{"step_type":"query_orders","actor_role":"","keywords":[],"attributes":{"train_type":"G"},"features":[],"search_filters":[{"key":"status","value":"Paid"}]}'
+    json_output: '{"step_type":"query_orders","train_type":"G","seat_class":"","services":[],"payment_mode":"","search_criteria":[],"order_filter":"status:Paid","actor_role":"","keywords":[]}'
 
 # Шумные токены при поиске auth/security кандидатов (gen_project_config.py)
 # classify_service_descriptions заменена на domain_features_schema выше.

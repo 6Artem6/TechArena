@@ -171,38 +171,30 @@ QwenClassifyOutput = StepParams
 _AGNOSTIC_CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {
-        "step_type":   {"type": "string"},
-        "actor_role":  {"type": "string"},
-        "keywords":    {"type": "array", "items": {"type": "string"}},
-        "attributes": {
-            "type": "object",
-            "description": "Domain-specific key-value modifiers",
-            "additionalProperties": {"type": "string"},
-        },
-        "features": {
+        "step_type":       {"type": "string"},
+        "train_type":      {"type": "string"},
+        "seat_class":      {"type": "string"},
+        "services": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "name":  {"type": "string"},
-                    "state": {"type": "boolean"},
+                    "name":    {"type": "string"},
+                    "present": {"type": "boolean"},
                 },
-                "required": ["name", "state"],
+                "required": ["name", "present"],
             },
         },
-        "search_filters": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "key":   {"type": "string"},
-                    "value": {"type": "string"},
-                },
-                "required": ["key", "value"],
-            },
-        },
+        "payment_mode":    {"type": "string"},
+        "search_criteria": {"type": "array", "items": {"type": "string"}},
+        "order_filter":    {"type": "string"},
+        "actor_role":      {"type": "string"},
+        "keywords":        {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["step_type", "keywords", "attributes", "features"],
+    "required": [
+        "step_type", "train_type", "seat_class", "services",
+        "payment_mode", "search_criteria", "order_filter", "actor_role", "keywords",
+    ],
 }
 
 # Alias для обратной совместимости внутри файла
@@ -223,16 +215,13 @@ _CLASSIFY_SCHEMA = _AGNOSTIC_CLASSIFY_SCHEMA
 # =============================================================================
 
 _AGNOSTIC_SYSTEM_TEMPLATE = (
-    "You are an action classifier for a {system_name} system.\n"
-    "Extract fields from the user action text into a valid JSON object.\n\n"
+    "You are a {system_name} action classifier.\n"
+    "Extract these fields from the user action text:\n\n"
     "step_type: ONE of: {step_types_list}\n\n"
-    "actor_role: \"admin\" (admin context), \"user/passenger\" (user context), \"\" (unknown)\n"
-    "keywords: 0-3 semantic terms for API handler matching (no IDs, no city names)\n\n"
-    "attributes: key-value dict for domain-specific modifiers (omit unknown/empty keys):\n"
-    "{attributes_rules}\n\n"
-    "{features_rules}\n\n"
-    "search_filters: structured filters for query/search steps "
-    "[{{\"key\":...,\"value\":...}}] or []\n\n"
+    "{attributes_rules}\n"
+    "{features_rules}\n"
+    "actor_role: \"admin\" (admin context), \"passenger\" (user context), \"\" (unknown)\n"
+    "keywords: 0-3 BM25 terms for finding the API handler (no city names, no train numbers)\n\n"
     "RULES:\n"
     "{domain_rules}\n\n"
     "Examples:\n"
@@ -265,28 +254,31 @@ def _build_classify_system(domain_context: str, _optional_groups: dict) -> str:
     step_types: list[str] = _cfg_get("allowed_step_types", ["book", "pay", "cancel", "other"])
     step_types_str = ", ".join(step_types)
 
-    # attributes
+    # attributes → плоские поля для Qwen (LLM-facing flat format)
+    # from_raw() конвертирует flat → StepParams.attributes при парсинге
     attr_schema: dict = _cfg_get("domain_attributes_schema", {})
     attr_lines: list[str] = []
     for attr_name, spec in attr_schema.items():
         allowed = spec.get("allowed_values", [])
-        if allowed:
-            attr_lines.append(f"  {attr_name} → {' | '.join(str(v) for v in allowed)}")
+        allowed_str = " | ".join(f'"{v}"' if not str(v).startswith('"') else str(v) for v in allowed)
+        if allowed_str:
+            attr_lines.append(f'{attr_name}: {allowed_str}, "" (unknown)')
         elif spec.get("description"):
-            attr_lines.append(f"  {attr_name} → {spec['description']}")
-    attributes_str = "\n".join(attr_lines) or "  (none defined)"
+            attr_lines.append(f'{attr_name}: {spec["description"]}')
+    attributes_str = "\n".join(attr_lines)
 
-    # features из domain_features_schema (yaml)
+    # features → services с present (простой flat формат для Qwen)
+    # from_raw() конвертирует services[{name,present}] → features[{name,state}]
     feat_schema: list[dict] = _cfg_get("domain_features_schema", [])
     if feat_schema:
         feat_lines = [f"  {f['name']} ({f.get('description', '')})" for f in feat_schema]
         features_str = (
-            "features: list ONLY explicitly mentioned optional addons:\n"
+            "services: list ONLY explicitly mentioned optional addons:\n"
             + ",\n".join(feat_lines)
-            + "\n  — each as {name, state:true/false}"
+            + "\n  — each as {name, present:true/false}"
         )
     else:
-        features_str = "features: optional addons mentioned in the action — each as {name, state:true/false}"
+        features_str = "services: optional addons mentioned — each as {name, present:true/false}"
 
     # domain rules
     rules: list[str] = _cfg_get("domain_specific_rules", [])
@@ -658,7 +650,7 @@ class QwenEncoder:
         Не требует списка кандидатов → можно запускать параллельно до Pass 2.
         Результат кешируется по тексту шага (ключ cls_v2).
         """
-        cache_key = ("cls_v4", action)
+        cache_key = ("cls_v5", action)
         cached = self._cache.get(cache_key)
         if isinstance(cached, StepParams):
             return cached
@@ -707,7 +699,7 @@ class QwenEncoder:
         uncached_indices: list[int] = []
 
         for i, action in enumerate(actions):
-            cached = self._cache.get(("cls_v4", action))
+            cached = self._cache.get(("cls_v5", action))
             if isinstance(cached, StepParams):
                 results[i] = cached
             else:
