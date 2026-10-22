@@ -217,112 +217,96 @@ _CLASSIFY_SCHEMA = _AGNOSTIC_CLASSIFY_SCHEMA
 # step_type список, train_type/seat_class ЖД-семантика, payment/search/role поля,
 # RULES и примеры.  {system_name} и {services_block} — плейсхолдеры для builder.
 
-_CLASSIFY_SYSTEM_TEMPLATE = (
-    "You are a {system_name} action classifier.\n"
-    "Extract these fields from the user action text:\n\n"
-    "step_type: ONE of: login, register, book, pay, cancel, rebook, collect,\n"
-    "  search_train, search_advanced, search_transit, view_trip, query_orders,\n"
-    "  query_consign, add_consign, update_consign, add_contact, get_contact,\n"
-    "  browse_food_station, query_food_trip, check_price, check_refund, query_insurance,\n"
-    "  enter_station, admin_login, add_station, add_train_type, add_route, add_trip, add_price, other\n\n"
-    "actor_role: \"admin\" (admin context), \"passenger\" (user context), \"\" (unknown)\n"
-    "keywords: 0-3 BM25 terms for finding the API handler (no city names, no train numbers)\n\n"
-    "attributes: key-value pairs for detected domain-specific modifiers (omit if unknown/empty):\n"
-    "  train_type → \"G\" (high-speed/bullet/CRH/DongChe) | \"OTHER\" (regular/slow)\n"
-    "  seat_class → \"FIRST\" (first-class/business) | \"SECOND\" (second-class/economy)\n"
-    "  payment_mode → \"internal\" (internal balance) | \"external\" (external service)\n"
-    "  search_criteria → comma-sep: cheapest, quickest, fewest_stops, transfer (if any)\n\n"
-    "{features_block}\n"
-    "search_filters: structured filters for query/search steps:\n"
-    "  [{\"key\":\"status\",\"value\":\"Paid\"}, {\"key\":\"date\",\"value\":\"travel\"}] or []\n\n"
+# =============================================================================
+# Агностический шаблон промпта — только структурная логика, без доменных данных.
+# Все плейсхолдеры заполняются из domain_config.yaml через _build_classify_system().
+# =============================================================================
+
+_AGNOSTIC_SYSTEM_TEMPLATE = (
+    "You are an action classifier for a {system_name} system.\n"
+    "Extract fields from the user action text into a valid JSON object.\n\n"
+    "step_type: ONE of: {step_types_list}\n\n"
+    "actor_role: \"admin\" (admin context), \"user/passenger\" (user context), \"\" (unknown)\n"
+    "keywords: 0-3 semantic terms for API handler matching (no IDs, no city names)\n\n"
+    "attributes: key-value dict for domain-specific modifiers (omit unknown/empty keys):\n"
+    "{attributes_rules}\n\n"
+    "{features_rules}\n\n"
+    "search_filters: structured filters for query/search steps "
+    "[{{\"key\":...,\"value\":...}}] or []\n\n"
     "RULES:\n"
-    "  search_transit = ONLY when transfer/connection/via/layover explicitly mentioned\n"
-    "  search_advanced = cheapest/quickest/fewest-stops (no transfer)\n"
-    "  features: omit unmentioned items (keep array short)\n"
-    "  attributes: omit keys with empty/unknown values\n"
-    "  keywords: for pay add payment signal; for book add seat/service signals; skip for search\n\n"
+    "{domain_rules}\n\n"
     "Examples:\n"
-    '  "book first-class with food on train and insurance" → '
-    '{"step_type":"book","actor_role":"passenger","keywords":["first class","food","insurance"],'
-    '"attributes":{"seat_class":"FIRST"},'
-    '"features":[{"name":"food_train","state":true},{"name":"insurance","state":true}],'
-    '"search_filters":[]}\n'
-    '  "pay using internal account balance" → '
-    '{"step_type":"pay","actor_role":"","keywords":["inside"],'
-    '"attributes":{"payment_mode":"internal"},"features":[],"search_filters":[]}\n'
-    '  "pay using external payment service" → '
-    '{"step_type":"pay","actor_role":"","keywords":["payment","service"],'
-    '"attributes":{"payment_mode":"external"},"features":[],"search_filters":[]}\n'
-    '  "advanced search: cheapest G-train trips" → '
-    '{"step_type":"search_advanced","actor_role":"","keywords":[],'
-    '"attributes":{"train_type":"G","search_criteria":"cheapest"},"features":[],"search_filters":[]}\n'
-    '  "ask for trips with a transfer via Suzhou" → '
-    '{"step_type":"search_transit","actor_role":"","keywords":["transfer"],'
-    '"attributes":{"search_criteria":"transfer"},"features":[],"search_filters":[]}\n'
-    '  "query G-train orders (status: Paid)" → '
-    '{"step_type":"query_orders","actor_role":"","keywords":[],'
-    '"attributes":{"train_type":"G"},"features":[],"search_filters":[{"key":"status","value":"Paid"}]}\n'
+    "{examples_block}\n\n"
     "Output ONLY valid JSON. No other text."
 )
 
-# ── Собирается: features block из project_config.json ────────────────────────
-# optional_service_groups → какие optional features есть в этом проекте.
-# Описания из domain_config.yaml:classify_service_descriptions (вручную, краткий словарь).
-# Если группа не в словаре → используется group_name as-is.
 
-_FEATURES_BLOCK_FALLBACK = (
-    "features: list ONLY explicitly mentioned optional addons:\n"
-    "  food_train (food on the train), food_station (food at the station),\n"
-    "  insurance/assurance, luggage/consign — each as {name, state:true/false}"
-)
+def _build_classify_system(domain_context: str, _optional_groups: dict) -> str:
+    """Собрать системный промпт classify_step() из domain_config.yaml.
 
-
-def _build_features_block(optional_groups: dict) -> str:
-    """features поле — из project_config.json:optional_service_groups.
-
-    Описания берутся из domain_config.yaml:classify_service_descriptions.
-    Если кеш недоступен → возвращает hardcoded fallback.
+    Вся доменная специфика (step_types, attributes, features, rules, examples)
+    читается из yaml — Python-код не знает про поезда, места и страховки.
+    domain_context (project_passport + auto_categories) добавляется сверху.
     """
-    if not optional_groups:
-        return _FEATURES_BLOCK_FALLBACK
-
     try:
         from src._config import cfg_get as _cfg_get
-        descs: dict = _cfg_get("classify_service_descriptions", {})
     except Exception:
-        descs = {}
+        def _cfg_get(k, d=None):  # type: ignore[misc]
+            return d
 
-    lines: list[str] = []
-    for group in sorted(optional_groups):
-        desc = descs.get(group, f"{group} service")
-        lines.append(f"  {desc}")
-
-    features_str = ",\n".join(lines)
-    return (
-        f"features: list ONLY explicitly mentioned optional addons:\n"
-        f"{features_str}\n"
-        f"  — each as {{name, state:true/false}}"
-    )
-
-
-def _build_classify_system(domain_context: str, optional_groups: dict) -> str:
-    """Собрать системный промпт classify_step() из двух частей:
-
-    1. domain_context (из project_passport.json + auto_categories.json)
-    2. _CLASSIFY_SYSTEM_TEMPLATE (вручную) с {features_block} из optional_service_groups
-    """
+    # system_name из domain_context
     system_name = "microservice"
     if domain_context:
         raw = domain_context.split("System context:")[-1].split(".")[0].strip()
         if raw:
             system_name = raw
 
-    features_block = _build_features_block(optional_groups)
+    # step_types
+    step_types: list[str] = _cfg_get("allowed_step_types", ["book", "pay", "cancel", "other"])
+    step_types_str = ", ".join(step_types)
+
+    # attributes
+    attr_schema: dict = _cfg_get("domain_attributes_schema", {})
+    attr_lines: list[str] = []
+    for attr_name, spec in attr_schema.items():
+        allowed = spec.get("allowed_values", [])
+        if allowed:
+            attr_lines.append(f"  {attr_name} → {' | '.join(str(v) for v in allowed)}")
+        elif spec.get("description"):
+            attr_lines.append(f"  {attr_name} → {spec['description']}")
+    attributes_str = "\n".join(attr_lines) or "  (none defined)"
+
+    # features из domain_features_schema (yaml)
+    feat_schema: list[dict] = _cfg_get("domain_features_schema", [])
+    if feat_schema:
+        feat_lines = [f"  {f['name']} ({f.get('description', '')})" for f in feat_schema]
+        features_str = (
+            "features: list ONLY explicitly mentioned optional addons:\n"
+            + ",\n".join(feat_lines)
+            + "\n  — each as {name, state:true/false}"
+        )
+    else:
+        features_str = "features: optional addons mentioned in the action — each as {name, state:true/false}"
+
+    # domain rules
+    rules: list[str] = _cfg_get("domain_specific_rules", [])
+    rules_str = "\n".join(f"  {r}" for r in rules) if rules else "  (none)"
+
+    # few-shot examples
+    examples: list[dict] = _cfg_get("few_shot_examples", [])
+    if examples:
+        examples_str = "\n".join(f'  "{ex["input"]}" → {ex["json_output"]}' for ex in examples)
+    else:
+        examples_str = '  "perform action" → {"step_type":"other","actor_role":"","keywords":[],"attributes":{},"features":[],"search_filters":[]}'
 
     body = (
-        _CLASSIFY_SYSTEM_TEMPLATE
+        _AGNOSTIC_SYSTEM_TEMPLATE
         .replace("{system_name}", system_name)
-        .replace("{features_block}", features_block)
+        .replace("{step_types_list}", step_types_str)
+        .replace("{attributes_rules}", attributes_str)
+        .replace("{features_rules}", features_str)
+        .replace("{domain_rules}", rules_str)
+        .replace("{examples_block}", examples_str)
     )
 
     return (f"{domain_context}\n\n" + body) if domain_context else body

@@ -448,16 +448,98 @@ complex_token_rules:
       external: ["payment", "payment", "service"]
       internal: ["inside"]
 
+# ---------------------------------------------------------------------------
+# Classify Prompt — Dynamic Builder (build_classifier_system_prompt)
+#
+# Вся доменная специфика classify_step() собирается из этих секций.
+# Для нового проекта — заменить только этот блок, Python-код не меняется.
+# ---------------------------------------------------------------------------
+
+# Разрешённые значения step_type
+allowed_step_types:
+  - login
+  - register
+  - book
+  - pay
+  - cancel
+  - rebook
+  - collect
+  - search_train
+  - search_advanced
+  - search_transit
+  - view_trip
+  - query_orders
+  - query_consign
+  - add_consign
+  - update_consign
+  - add_contact
+  - get_contact
+  - browse_food_station
+  - query_food_trip
+  - check_price
+  - check_refund
+  - query_insurance
+  - enter_station
+  - admin_login
+  - add_station
+  - add_train_type
+  - add_route
+  - add_trip
+  - add_price
+  - other
+
+# Схема attributes: что может появиться в атрибутах классификации
+domain_attributes_schema:
+  train_type:
+    description: "Speed category of train"
+    allowed_values: ['"G" (high-speed/bullet/CRH/DongChe)', '"OTHER" (regular/slow)']
+  seat_class:
+    description: "Class of service"
+    allowed_values: ['"FIRST" (first-class/business)', '"SECOND" (second-class/economy)']
+  payment_mode:
+    description: "Source of funds"
+    allowed_values: ['"internal" (internal balance)', '"external" (external service)']
+  search_criteria:
+    description: "Search optimization criteria (comma-separated if multiple)"
+    allowed_values: [cheapest, quickest, fewest_stops, transfer]
+
+# Схема features: optional addons/modifiers (заменяет classify_service_descriptions)
+# Только те, что реально используются в проекте (из optional_service_groups)
+domain_features_schema:
+  - name: food_train
+    description: "food served on board the train"
+  - name: food_station
+    description: "food available at the station"
+  - name: insurance
+    description: "travel insurance/assurance coverage"
+  - name: luggage
+    description: "luggage/consign baggage handling"
+
+# Доменно-специфичные правила для RULES-блока промпта
+domain_specific_rules:
+  - "search_transit = ONLY when transfer/connection/via/layover explicitly mentioned"
+  - "search_advanced = cheapest/quickest/fewest-stops (no transfer)"
+  - "features: omit unmentioned items (keep array short)"
+  - "attributes: omit keys with empty/unknown values"
+  - "keywords: for pay add payment signal; for book add seat/service signals; skip for search"
+
+# Few-shot примеры для промпта (JSON-строки внутри одинарных кавычек YAML)
+few_shot_examples:
+  - input: "book first-class with food on train and insurance"
+    json_output: '{"step_type":"book","actor_role":"passenger","keywords":["first class","food","insurance"],"attributes":{"seat_class":"FIRST"},"features":[{"name":"food_train","state":true},{"name":"insurance","state":true}],"search_filters":[]}'
+  - input: "pay using internal account balance"
+    json_output: '{"step_type":"pay","actor_role":"","keywords":["inside"],"attributes":{"payment_mode":"internal"},"features":[],"search_filters":[]}'
+  - input: "pay using external payment service"
+    json_output: '{"step_type":"pay","actor_role":"","keywords":["payment","service"],"attributes":{"payment_mode":"external"},"features":[],"search_filters":[]}'
+  - input: "advanced search: cheapest G-train trips"
+    json_output: '{"step_type":"search_advanced","actor_role":"","keywords":[],"attributes":{"train_type":"G","search_criteria":"cheapest"},"features":[],"search_filters":[]}'
+  - input: "ask for trips with a transfer via Suzhou"
+    json_output: '{"step_type":"search_transit","actor_role":"","keywords":["transfer"],"attributes":{"search_criteria":"transfer"},"features":[],"search_filters":[]}'
+  - input: "query G-train orders (status: Paid)"
+    json_output: '{"step_type":"query_orders","actor_role":"","keywords":[],"attributes":{"train_type":"G"},"features":[],"search_filters":[{"key":"status","value":"Paid"}]}'
+
 # Шумные токены при поиске auth/security кандидатов (gen_project_config.py)
-# Generic HTTP / config / bootstrap слова — не связаны с auth-логикой
-# Описания optional service groups для classify_step() system prompt.
-# Ключи = group names из project_config.json:optional_service_groups.
-# Значения — строки которые вставляются в services поле промпта.
-# Для нового проекта: дополнить group names с их описаниями.
-classify_service_descriptions:
-  food: "food_train (food on the train), food_station (food at the station)"
-  insurance: "insurance/assurance (travel protection)"
-  consign: "luggage/consign (baggage handling)"
+# classify_service_descriptions заменена на domain_features_schema выше.
 
 auth_namespace_noise:
   - cors
