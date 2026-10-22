@@ -403,20 +403,44 @@ class QwenEncoder:
 
     @staticmethod
     def _load_domain_context() -> str:
-        """Загрузить domain context из project_passport.json для classify_step()."""
+        """Загрузить domain context из project_passport.json + auto_categories.json."""
         try:
             from src._config import cfg_cache_dir
-            pp_path = cfg_cache_dir() / "project_passport.json"
-            if not pp_path.exists():
-                return ""
-            pp = json.loads(pp_path.read_text(encoding="utf-8"))
-            domain = pp.get("domain", "")
-            features = pp.get("main_features", [])
+            cache = cfg_cache_dir()
             parts: list[str] = []
-            if domain:
-                parts.append(f"System context: {domain}.")
-            if features:
-                parts.append("Business features: " + "; ".join(features[:3]) + ".")
+            domain = ""
+
+            # project_passport.json — domain, features, journeys
+            pp_path = cache / "project_passport.json"
+            if pp_path.exists():
+                pp = json.loads(pp_path.read_text(encoding="utf-8"))
+                domain = pp.get("domain", "")
+                features = pp.get("main_features", [])
+                journeys = pp.get("user_journeys", [])
+                if domain:
+                    parts.append(f"System context: {domain}.")
+                if features:
+                    parts.append("Business features: " + "; ".join(features[:3]) + ".")
+                if journeys:
+                    # "Journey 1: A -> B" → "A -> B" (убрать "Journey N: " префикс)
+                    flows = []
+                    for j in journeys[:3]:
+                        body = j.split(": ", 1)[-1] if ": " in j else j
+                        flows.append(body)
+                    parts.append("User flows: " + "; ".join(flows) + ".")
+
+            # auto_categories.json — Qwen-generated business domain descriptions
+            ac_path = cache / "auto_categories.json"
+            if ac_path.exists():
+                cats = json.loads(ac_path.read_text(encoding="utf-8"))
+                area_descs = [
+                    f"{c['category_id']} ({c['description']})"
+                    for c in cats
+                    if c.get("verified") and c.get("description") and c.get("category_id")
+                ]
+                if area_descs:
+                    parts.append("Detected business areas: " + ", ".join(area_descs) + ".")
+
             ctx = " ".join(parts)
             if ctx:
                 print(f"[qwen] domain context loaded: {domain[:50]}", file=sys.stderr)
