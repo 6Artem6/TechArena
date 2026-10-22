@@ -92,7 +92,15 @@ def derive_func_variant_suffixes(modules: list[str], prefix: str, suffix: str) -
 def _load_tag_stop_base() -> frozenset[str]:
     """NLP baseline стоп-слова для тегов сервисов — загружаются из domain_config.yaml."""
     from src._config import cfg_get as _cfg_get
-    return frozenset(_cfg_get("tag_stop_base", []))
+    base = frozenset(_cfg_get("tag_stop_base", []))
+    infra = frozenset(_cfg_get("infra_module_tokens", []))
+    return base | infra
+
+
+def _load_infra_module_tokens() -> frozenset[str]:
+    """First-tokens инфра-модулей — эти сервисы не являются optional addons."""
+    from src._config import cfg_get as _cfg_get
+    return frozenset(_cfg_get("infra_module_tokens", []))
 
 
 def derive_high_freq_tokens(
@@ -291,7 +299,8 @@ def derive_optional_groups_from_tags(
 
     # Qwen шаг 2: singletons — только сервисы НЕ в кластерах и НЕ core
     # Core: infra tokens + G/OTHER pairs + high-freq name tokens
-    all_core_toks = core_name_toks | other_pair_first
+    infra_toks = _load_infra_module_tokens()
+    all_core_toks = core_name_toks | other_pair_first | infra_toks
 
     def _is_core(mod: str) -> bool:
         norm = mod.removeprefix(prefix).removesuffix(suffix)

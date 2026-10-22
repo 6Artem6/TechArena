@@ -167,6 +167,7 @@ duplicate_url_path: false
 # Generic English words которые появляются в Qwen-сгенерированных тегах у всех сервисов
 # но не являются domain-специфичными — нужно исключить до кластеризации
 tag_stop_base:
+  # Generic NLP stop words — встречаются в Qwen-тегах но не являются domain-специфичными
   - management
   - retrieval
   - service
@@ -207,6 +208,21 @@ tag_stop_base:
   - send
   - notify
   - contact
+
+# Инфраструктурные first-tokens имён модулей — используются в двух местах:
+#   1. tag_stop_base (кластеризация не по этим токенам)
+#   2. infra_core filter в gen_project_config.py (эти сервисы не попадают в singletons)
+# Критерий: один такой сервис, не является optional booking addon
+infra_module_tokens:
+  - auth
+  - security
+  - gateway
+  - common
+  - wait
+  - execute
+  - delivery
+  - notification
+  - verification
 
 # Архитектурные суффиксы-исключения (gen_project_config.py tier2)
 # Суффиксы классов слишком generic для arch-роли — встречаются у всех Spring Boot сервисов
