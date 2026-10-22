@@ -471,15 +471,6 @@ def _detect_project_language(sk: dict) -> str:
     return counts.most_common(1)[0][0]
 
 
-# Известные архитектурные токены — детерминированный базис для tier2
-_ARCH_TOKEN_WHITELIST = frozenset({
-    "controller", "service", "impl", "repository", "handler", "manager",
-    "factory", "client", "server", "dto", "dao", "mapper", "provider",
-    "util", "utils", "listener", "adapter", "interceptor", "proxy",
-    "validator", "builder", "registry", "config",
-})
-
-
 def _extract_arch_suffix_candidates(sk: dict, modules: list[str]) -> list[str]:
     """Суффиксы camelCase имён классов встречающиеся в >= 20% модулей → arch candidates.
 
@@ -503,7 +494,7 @@ def _extract_arch_suffix_candidates(sk: dict, modules: list[str]) -> list[str]:
         mod = node.get("module", "")
         if mod:
             svc_has[suf].add(mod)
-    threshold = max(3, len(modules) * 0.20)
+    threshold = max(2, len(modules) * 0.10)
     return [
         suf for suf, svcs in sorted(svc_has.items(), key=lambda x: -len(x[1]))
         if len(svcs) >= threshold
@@ -511,64 +502,36 @@ def _extract_arch_suffix_candidates(sk: dict, modules: list[str]) -> list[str]:
 
 
 def derive_tier2_arch_tokens(sk: dict, domain_tokens: set[str], no_qwen: bool) -> list[str]:
-    # Все токены из имён классов скелета
-    all_class_tokens = set(_extract_class_tokens(sk, top_n=300))
-    # Детерминированный базис: whitelist ∩ скелет, без доменных токенов
-    base = sorted(_ARCH_TOKEN_WHITELIST & all_class_tokens - domain_tokens)
-
-    if no_qwen:
-        return base
-
-    # Кандидаты для Qwen-расширения: суффиксы классов в >= 20% сервисов, не в whitelist
-    # Суффиксы точнее отражают архитектурные паттерны (ServiceImpl → impl) чем все токены
+    from src._config import cfg_get as _cfg_get
     modules_list = sorted({n.get("module", "") for n in sk["nodes"].values() if n.get("module")})
-    arch_suffix_cands = _extract_arch_suffix_candidates(sk, modules_list)
-    extra_cands = [
-        t for t in arch_suffix_cands
-        if t not in _ARCH_TOKEN_WHITELIST and t not in domain_tokens
-    ][:15]
-
-    if not extra_cands:
-        return base
-
-    from src.localization.qwen_encoder import QwenEncoder
-    enc = QwenEncoder()
-    if not enc.enabled:
-        print("[WARN] Qwen недоступен — tier2_arch_tokens: только детерминированный базис", file=sys.stderr)
-        return base
-
-    schema: dict = {"type": "array", "items": {"type": "string"}}
-    prompt = (
-        f"Java Spring Boot class name tokens — classify as architectural role or not:\n"
-        f"{', '.join(extra_cands)}\n\n"
-        f"TASK: Select tokens that name an ARCHITECTURAL COMPONENT ROLE.\n"
-        f"INCLUDE: handler, manager, factory, client, server, dao, mapper, provider,\n"
-        f"  listener, adapter, interceptor, proxy, validator, builder, registry\n"
-        f"EXCLUDE: business domain terms, data/status words (result, data, list, type,\n"
-        f"  status, record), verbs (get, add, send), app bootstraps (application, init),\n"
-        f"  messaging (rabbit, queues), any framework-specific words\n\n"
-        f"Return ONLY a JSON array of architectural role tokens from the input list."
-    )
-    try:
-        raw = enc._call_ollama(prompt, schema=schema, num_predict=150, timeout=30)
-        if isinstance(raw, list):
-            qwen_extra = [t for t in raw if t in set(extra_cands)]
-            return sorted(set(base) | set(qwen_extra))
-    except Exception as e:
-        print(f"[WARN] Qwen ошибка tier2: {e}", file=sys.stderr)
-    return base
+    arch_stop = frozenset(_cfg_get("arch_suffix_stop", []))
+    arch_extra = frozenset(_cfg_get("arch_token_extra", []))
+    auto = {
+        s for s in _extract_arch_suffix_candidates(sk, modules_list)
+        if s not in domain_tokens and s not in arch_stop
+    }
+    return sorted(auto | (arch_extra - domain_tokens))
 
 
 # ---------------------------------------------------------------------------
 # Шаг 5: tier4_remote_tokens — Qwen генерирует инфра-токены для языка
 # ---------------------------------------------------------------------------
 
-# Известные auth/security инфра-токены — детерминированный базис для tier4
-_AUTH_TOKEN_WHITELIST = frozenset({
-    "auth", "authentication", "authorize", "authorization",
-    "verify", "verification", "jwt", "token", "credential",
-    "password", "secret", "captcha", "encoder", "username",
-})
+def _derive_method_noise(sk: dict, all_modules: set[str], threshold: float = 0.50) -> frozenset[str]:
+    """Токены из имён методов встречающиеся у >= threshold доли всех модулей → шум."""
+    svc_toks: dict[str, set[str]] = {m: set() for m in all_modules}
+    for node in sk["nodes"].values():
+        if node.get("kind") != "method":
+            continue
+        mod = node.get("module", "")
+        if mod not in svc_toks:
+            continue
+        name = node.get("name", "")
+        if "<" in name:
+            continue
+        for tok in _tokenize_camel(name):
+            svc_toks[mod].add(tok)
+    return derive_high_freq_tokens(svc_toks, len(all_modules), threshold=threshold)
 
 
 def _extract_auth_namespace_candidates(
@@ -586,11 +549,8 @@ def _extract_auth_namespace_candidates(
         if any(kw in low for kw in ("auth", "security", "verif", "jwt")):
             auth_mods.add(mod)
 
-    _noise = frozenset({
-        "cors", "configure", "mapping", "configurer", "get", "add",
-        "find", "create", "delete", "all", "non", "default", "main",
-        "rest", "template", "rand", "color", "image", "cookie",
-    })
+    from src._config import cfg_get as _cfg_get
+    noise = frozenset(_cfg_get("auth_namespace_noise", [])) | _derive_method_noise(sk, all_modules)
     counts: Counter[str] = Counter()
     for node in sk["nodes"].values():
         if node.get("kind") != "method":
@@ -602,58 +562,20 @@ def _extract_auth_namespace_candidates(
         if "<" in name:
             continue
         for tok in _tokenize_camel(name):
-            if tok not in domain_tokens and tok not in _noise:
+            if tok not in domain_tokens and tok not in noise:
                 counts[tok] += 1
     return [tok for tok, _ in counts.most_common(20)]
 
 
 def derive_tier4_remote_tokens(sk: dict, language: str, no_qwen: bool) -> list[str]:
-    # Все токены из имён классов и методов скелета
-    all_class = set(_extract_class_tokens(sk, top_n=500))
-    all_method = set(_extract_method_tokens(sk, top_n=500))
-    all_tokens = all_class | all_method
-    # Детерминированный базис: known auth whitelist ∩ реальные токены скелета
-    base = sorted(_AUTH_TOKEN_WHITELIST & all_tokens)
-
-    if no_qwen:
-        return base or sorted(_AUTH_TOKEN_WHITELIST)
-
-    # Кандидаты для Qwen-расширения: токены методов из auth/security/verif сервисов
-    # Используем _extract_auth_namespace_candidates для portable поиска по модулям
+    from src._config import cfg_get as _cfg_get
     domain_tokens = {n.get("module", "").removeprefix("ts-").removesuffix("-service")
                      .replace("-", "_") for n in sk["nodes"].values() if n.get("module")}
-    extra_cands = [
-        t for t in _extract_auth_namespace_candidates(sk, domain_tokens)
-        if t not in _AUTH_TOKEN_WHITELIST
-    ][:15]
-
-    if not extra_cands:
-        return base
-
-    from src.localization.qwen_encoder import QwenEncoder
-    enc = QwenEncoder()
-    if not enc.enabled:
-        print("[WARN] Qwen недоступен — tier4_remote_tokens: только детерминированный базис", file=sys.stderr)
-        return base
-
-    schema: dict = {"type": "array", "items": {"type": "string"}}
-    prompt = (
-        f"Candidate tokens from {language} security/auth class and method names:\n"
-        f"{', '.join(extra_cands)}\n\n"
-        f"TASK: Which tokens relate to USER AUTHENTICATION or CREDENTIAL HANDLING?\n"
-        f"INCLUDE: tokens like 'expir', 'refresh', 'claim', 'bearer', 'otp', 'role', 'principal'\n"
-        f"EXCLUDE: general HTTP (cors, mapping), config terms (configure, configurer),\n"
-        f"  common verbs (check, send, build), architectural roles (service, controller)\n\n"
-        f"Return ONLY a JSON array of auth/credential tokens from the input list."
-    )
-    try:
-        raw = enc._call_ollama(prompt, schema=schema, num_predict=150, timeout=30)
-        if isinstance(raw, list):
-            qwen_extra = [t for t in raw if t in set(extra_cands)]
-            return sorted(set(base) | set(qwen_extra))
-    except Exception as e:
-        print(f"[WARN] Qwen ошибка tier4: {e}", file=sys.stderr)
-    return base
+    auth_whitelist = frozenset(_cfg_get("auth_token_whitelist", []))
+    candidates = _extract_auth_namespace_candidates(sk, domain_tokens)
+    # Фильтр: оставить только токены из whitelist (из конфига)
+    filtered = [t for t in candidates if t in auth_whitelist]
+    return sorted(filtered) if filtered else sorted(auth_whitelist & set(candidates))
 
 
 # ---------------------------------------------------------------------------

@@ -162,3 +162,76 @@ safe_keyword_step_types:
 
 # Дублировать URL path в doc_text base (усиливает TF URL-сегментов в BM25)
 duplicate_url_path: false
+
+# Архитектурные суффиксы-исключения (gen_project_config.py tier2)
+# Суффиксы классов слишком generic для arch-роли — встречаются у всех Spring Boot сервисов
+arch_suffix_stop:
+  - application
+  - data
+  - info
+  - type
+  - result
+  - response
+  - request
+  - queues
+
+# Дополнительные arch-токены которые редко встречаются как суффиксы классов
+# но являются архитектурными ролями (< 10% модулей в проекте)
+arch_token_extra:
+  - dto
+  - handler
+  - provider
+  - util
+  - utils
+
+# Разрешённые auth/security токены — фильтр поверх auto-candidates (gen_project_config.py tier4)
+# Токены из auth-namespace модулей, которые семантически связаны с auth/credentials
+auth_token_whitelist:
+  - auth
+  - authentication
+  - authorize
+  - authorization
+  - verify
+  - verification
+  - jwt
+  - token
+  - credential
+  - credentials
+  - password
+  - secret
+  - captcha
+  - encoder
+  - username
+  - expir
+  - refresh
+  - claim
+  - bearer
+  - otp
+  - role
+  - principal
+  - authorities
+  - enabled
+  - locked
+
+# Шумные токены при поиске auth/security кандидатов (gen_project_config.py)
+# Generic HTTP / config / bootstrap слова — не связаны с auth-логикой
+auth_namespace_noise:
+  - cors
+  - configure
+  - mapping
+  - configurer
+  - get
+  - add
+  - find
+  - create
+  - delete
+  - all
+  - non
+  - default
+  - main
+  - rest
+  - template
+  - rand
+  - color
+  - image
+  - cookie
