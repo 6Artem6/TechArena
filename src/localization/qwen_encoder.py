@@ -220,7 +220,7 @@ _AGNOSTIC_SYSTEM_TEMPLATE = (
     "step_type: ONE of: {step_types_list}\n\n"
     "{attributes_rules}\n"
     "{features_rules}\n"
-    "actor_role: \"admin\" (admin context), \"passenger\" (user context), \"\" (unknown)\n"
+    "actor_role: \"admin\" (admin context), \"passenger\" (passenger/user context), \"\" (unknown)\n"
     "keywords: 0-3 BM25 terms for finding the API handler (no city names, no train numbers)\n\n"
     "RULES:\n"
     "{domain_rules}\n\n"
@@ -250,9 +250,11 @@ def _build_classify_system(domain_context: str, _optional_groups: dict) -> str:
         if raw:
             system_name = raw
 
-    # step_types
+    # step_types — разбиваем на строки по 7 значений (Qwen 3B лучше видит короткие строки)
     step_types: list[str] = _cfg_get("allowed_step_types", ["book", "pay", "cancel", "other"])
-    step_types_str = ", ".join(step_types)
+    chunk = 7
+    rows = [", ".join(step_types[i:i + chunk]) for i in range(0, len(step_types), chunk)]
+    step_types_str = (",\n  ".join(rows)) if len(rows) > 1 else rows[0]
 
     # attributes → плоские поля для Qwen (LLM-facing flat format)
     # from_raw() конвертирует flat → StepParams.attributes при парсинге
@@ -650,7 +652,7 @@ class QwenEncoder:
         Не требует списка кандидатов → можно запускать параллельно до Pass 2.
         Результат кешируется по тексту шага (ключ cls_v2).
         """
-        cache_key = ("cls_v5", action)
+        cache_key = ("cls_v6", action)
         cached = self._cache.get(cache_key)
         if isinstance(cached, StepParams):
             return cached
@@ -699,7 +701,7 @@ class QwenEncoder:
         uncached_indices: list[int] = []
 
         for i, action in enumerate(actions):
-            cached = self._cache.get(("cls_v5", action))
+            cached = self._cache.get(("cls_v6", action))
             if isinstance(cached, StepParams):
                 results[i] = cached
             else:
