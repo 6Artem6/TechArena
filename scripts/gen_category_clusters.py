@@ -209,12 +209,22 @@ def build_passport_context(
     return "\n".join(lines) if lines else ""
 
 
-def label_cluster_qwen(tokens: list[str], enc, context: str = "") -> dict:
-    """Qwen: назвать кластер. context — паспорта сервисов для low_confidence."""
+def label_cluster_qwen(
+    tokens: list[str], enc, context: str = "", project_context: str = ""
+) -> dict:
+    """Qwen: назвать кластер.
+
+    project_context — домен/фичи проекта из project_passport.json (глобальный).
+    context — паспорта конкретных сервисов для low_confidence кластеров (кластерный).
+    """
     token_str = json.dumps(tokens, ensure_ascii=False)
+    proj_block = (
+        f"\nProject background:\n{project_context}\n" if project_context else ""
+    )
     ctx_block = f"\nAdditional context from service passports:\n{context}\n" if context else ""
     prompt = (
         f"I have a cluster of code tokens from a microservice codebase: {token_str}"
+        f"{proj_block}"
         f"{ctx_block}\n"
         "Identify the business domain these tokens represent.\n"
         "Respond with JSON only:\n"
@@ -268,6 +278,30 @@ def main() -> None:
     cache_dir = cfg_cache_dir()
     profile_path = cache_dir / "project_profile.json"
     passports_path = cache_dir / "service_passports.pkl"
+
+    # --- Project Passport Context ---
+    project_context = ""
+    passport_path = cache_dir / "project_passport.json"
+    if passport_path.exists():
+        try:
+            pp = json.loads(passport_path.read_text(encoding="utf-8"))
+            domain = pp.get("domain", "")
+            features = pp.get("main_features", [])
+            journeys = pp.get("user_journeys", [])
+            parts = []
+            if domain:
+                parts.append(f"Domain: {domain}")
+            if features:
+                parts.append("Features: " + "; ".join(features))
+            if journeys:
+                parts.append("User journeys: " + "; ".join(journeys))
+            project_context = "\n".join(parts)
+            print(f"Project passport loaded: {domain[:60]}", file=sys.stderr)
+        except Exception as e:
+            print(f"  [warn] project_passport.json read failed: {e}", file=sys.stderr)
+    else:
+        print("project_passport.json не найден — запустите gen_project_passport.py",
+              file=sys.stderr)
 
     # --- Этап 1: Сбор токенов ---
     print("Сбор токенов...", file=sys.stderr)
@@ -340,7 +374,8 @@ def main() -> None:
                 context = build_passport_context(tok_list, sk, passports)
                 if context:
                     print(f"  #{lbl} [low_conf] → passport context добавлен", file=sys.stderr)
-            labeled = label_cluster_qwen(tok_list, enc, context=context)
+            labeled = label_cluster_qwen(tok_list, enc, context=context,
+                                         project_context=project_context)
             info["category_id"] = labeled.get("category_id")
             info["description"] = labeled.get("description")
             info["patterns"] = labeled.get("patterns", [])
@@ -390,7 +425,8 @@ def main() -> None:
                     else:
                         print(f"  #{lbl:3d} passport context пуст — повтор без контекста",
                               file=sys.stderr)
-                    labeled = label_cluster_qwen(tok_list, enc_retry, context=context)
+                    labeled = label_cluster_qwen(tok_list, enc_retry, context=context,
+                                                 project_context=project_context)
                     new_cat = labeled.get("category_id")
                     new_desc = labeled.get("description")
                     new_pats = labeled.get("patterns", [])
