@@ -389,7 +389,7 @@ class QwenEncoder:
             "prompt":  prompt,
             "format":  schema if schema is not None else _OLLAMA_JSON_SCHEMA,
             "stream":  False,
-            "options": {"temperature": 0, "num_predict": num_predict or _NUM_PREDICT},
+            "options": {"temperature": 0, "seed": 42, "num_predict": num_predict or _NUM_PREDICT},
         }).encode()
         req = Request(
             _OLLAMA_GENERATE_URL,

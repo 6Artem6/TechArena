@@ -414,7 +414,7 @@ def derive_optional_groups_from_tags(
             f"  food/meal → group 'food'\n"
             f"  insurance/assurance → group 'insurance'\n"
             f"  luggage/consignment → group 'consign'\n"
-            f"SKIP core infrastructure (station, route, train, seat, user, cancel, rebook).\n"
+            f"SKIP core infrastructure (station, route, train, seat, user, cancel, rebook, delivery).\n"
             f"Return ONLY JSON for OPTIONAL services: {{\"service-name\": \"group-name\"}}"
         )
         try:
