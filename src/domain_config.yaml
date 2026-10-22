@@ -455,6 +455,14 @@ complex_token_rules:
 # Для нового проекта — заменить только этот блок, Python-код не меняется.
 # ---------------------------------------------------------------------------
 
+# Роли участников для actor_role поля промпта
+domain_roles:
+  - {value: admin, description: "admin/system context"}
+  - {value: passenger, description: "passenger/user context"}
+
+# Подсказка для keywords поля — что НЕ включать (domain-специфично)
+keywords_exclude_hint: "no city names, no train numbers"
+
 # Разрешённые значения step_type
 allowed_step_types:
   - login
