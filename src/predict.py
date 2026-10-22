@@ -22,6 +22,35 @@ SKELETON = Path(os.getenv("TT_SKELETON", str(_ROOT / "tt-challenge" / "skeleton"
 TARGETS  = Path(os.getenv("TT_TARGETS",  str(_ROOT / "tt-challenge" / "targets" / "trainticket")))
 
 sys.path.insert(0, str(_ROOT))
+
+# ---------------------------------------------------------------------------
+# Bootstrap: проверить критические кеши, сгенерировать при отсутствии
+# ---------------------------------------------------------------------------
+_CRITICAL_CACHES = [
+    _ROOT / "cache" / "fsm_transitions.json",
+    _ROOT / "cache" / "sibling_metadata.json",
+    _ROOT / "cache" / "project_config.json",
+    _ROOT / "cache" / "optional_patterns.json",
+]
+
+def _ensure_critical_caches() -> None:
+    missing = [p for p in _CRITICAL_CACHES if not p.exists()]
+    if not missing:
+        return
+    import subprocess
+    names = ", ".join(p.name for p in missing)
+    print(f"[bootstrap] Отсутствуют кеши: {names}", file=sys.stderr)
+    print("[bootstrap] Запускаю gen_all_caches.py --missing ...", file=sys.stderr)
+    result = subprocess.run(
+        [sys.executable, str(_ROOT / "scripts" / "gen_all_caches.py"), "--missing"],
+        cwd=str(_ROOT),
+    )
+    if result.returncode != 0:
+        print("[bootstrap] ⚠ gen_all_caches.py завершился с ошибкой — продолжаю без части кешей",
+              file=sys.stderr)
+
+_ensure_critical_caches()
+
 from src.core.skeleton_index import Index, load_json              # noqa: E402
 from src.localization.ui_context import ui_context, handler_docs  # noqa: E402
 from src.localization.scorer import Scorer                        # noqa: E402
