@@ -133,28 +133,134 @@ system_refuses_rules:
 
 ---
 
-## RuleEngine — план реализации
+## UniversalTokenEngine — полный data-driven подход
 
-### ✅ Шаг 1 (P1): `src/rule_engine.py` создан
+### Архитектура (целевая)
 
-```python
-class RuleEngine:
-    def evaluate_into(self, text: str, target: Any) -> None:
-        # pure loop: no field names, no domain knowledge
-        # setattr(target, rule["field"], rule["value"])
+Две таблицы в yaml полностью заменяют весь процедурный код классификации:
+
+```
+extraction_rules       → заменяет _apply_food, _apply_insurance, _apply_luggage,
+                         _apply_train_type, _apply_seat_class, _SYSTEM_REFUSES
+                         (unified RuleEngine для всех полей)
+
+token_injection_rules  → заменяет все if info.step_type == ... блоки в _build_extra_tokens()
+                         и attr→token маппинги (seat_class→"first class", has_food→"food")
+
+complex_token_rules    → заменяет pay-логику с Qwen priority + regex fallback
+
+qwen_service_mappings  → описывает как Qwen StepParams.get_service() маппится в StepInfo поля
+                         (food_train + food_station → has_food с логикой OR)
 ```
 
-### ✅ Шаг 2 (P1): 6 констант удалены из `step_typer.py`, правила в yaml
+Python-класс `UniversalTokenEngine.process_step()` использует только `getattr`/`setattr` — ни одного domain имени.
 
-Файлы изменены: `step_typer.py` (c8e9f87), `domain_config.yaml`  
-`StepInfo.pay_type: str = ""` добавлен как новое поле.
+### ✅ Шаг 1 (P1): `src/rule_engine.py` создан — коммит c8e9f87
 
-### ✅ Шаг 2b: `scripts/gen_classification_rules.py` — генерация правил из скелета через Qwen
+### ✅ Шаг 2 (P1): 6 констант → `domain_config.yaml:classification_rules` — коммит c8e9f87
 
-Данные для промпта: `_extract_enum_summary(sk)` + `_extract_service_roles(sk)`  
-Qwen видит: `SeatClass: FIRSTCLASS, SECONDCLASS, BUSINESS...` → генерирует NL regex  
-Post-processing: нормализация `target_value`, fix regex alternation без группы  
-Сохраняет в `cache/generated_classification_rules.json` для ревью перед merge в yaml
+`_SEAT_FIRST/_SECOND`, `_PAY_INTERNAL/_EXTERNAL/_EMPTY`, `_SYSTEM_REFUSES` удалены из `.py`.  
+`StepInfo.pay_type: str = ""` добавлен.
+
+### ✅ Шаг 2b: `scripts/gen_classification_rules.py` — Qwen генерирует rules из скелета — коммит 6318edb
+
+Данные: `_extract_enum_summary(sk)` + `_extract_service_roles(sk)` → few-shot промпт → NL regex.
+
+### 🔴 Шаг 3 (P2): `token_injection_rules` — убрать все if-блоки по step_type
+
+Файл: `step_typer._build_extra_tokens()`  
+Заменить ~40 строк if-блоков на:
+
+```yaml
+token_injection_rules:
+  - match_field: seat_class
+    match_value: FIRST
+    tokens: ["first class"]
+  - match_field: seat_class
+    match_value: SECOND
+    tokens: ["second class"]
+  - match_field: has_food
+    match_value: true
+    tokens: ["food"]
+  - match_field: has_insurance
+    match_value: true
+    tokens: ["insurance"]
+  - match_field: has_luggage
+    match_value: true
+    tokens: ["consign luggage"]
+  - match_field: step_type
+    match_value: search_transit
+    tokens: ["transfer", "transfer", "via"]
+  - match_field: step_type
+    match_value: cancel
+    tokens: ["ticket", "verify"]
+  - match_field: step_type
+    match_value: rebook
+    tokens: ["rebook", "rebook"]
+  - match_field: step_type
+    match_value: check_price
+    tokens: ["price", "price"]
+  - match_field: step_type
+    match_value: query_insurance
+    tokens: ["assurance", "assurance"]
+  - match_field: step_type
+    match_value: update_consign
+    tokens: ["consign", "consign", "update"]
+  - match_field: step_type
+    match_value: add_consign
+    tokens: ["insert"]
+
+complex_token_rules:
+  - trigger_field: step_type
+    trigger_value: pay
+    priority_source: payment_mode     # step_params поле
+    fallback_field: pay_type          # StepInfo поле (из RuleEngine)
+    value_mapping:
+      external: ["payment", "payment", "service"]
+      internal: ["inside"]
+```
+
+Python движок: `getattr(info, rule["match_field"]) == rule["match_value"]` → `tokens.extend(rule["tokens"])`.
+
+### 🔴 Шаг 4 (P2): `extraction_rules` — унифицировать все regex extraction
+
+Сейчас три источника: `classification_rules` (yaml), `optional_patterns.json` (кеш), `step_train_patterns` (yaml).  
+Цель: единый `extraction_rules` в yaml — один движок читает всё.  
+
+Нюанс: `_apply_food` имеет два уровня:
+1. **Qwen path** (приоритет): `step_params.get_service("food_train") or food_station`
+2. **Regex fallback**: `extraction_rules`
+
+Qwen path описывается отдельно (`qwen_service_mappings`):
+```yaml
+qwen_service_mappings:
+  - qwen_service: [food_train, food_station]   # OR-логика
+    info_field: has_food
+  - qwen_service: insurance
+    info_field: has_insurance
+  - qwen_service: luggage
+    info_field: has_luggage
+```
+Python читает этот маппинг, не знает конкретных полей.
+
+### 🟡 Шаг 5 (P3): `_build_extra_tokens` bridge tokens → `gen_step_token_bridges.py`
+
+Шаги без явных config-правил (check_schedule, add_order и др. в новых сценариях) →  
+offline BM25 co-occurrence: `scripts/gen_step_token_bridges.py` → `cache/step_token_bridges.pkl`.
+
+---
+
+## Приоритетный порядок
+
+```
+✅ P1 — RuleEngine + 6 констант (сделано, коммиты c8e9f87, 6318edb)
+🔴 P2 — token_injection_rules (убрать _build_extra_tokens if-блоки, ~40 строк) [30 мин]
+🔴 P2 — complex_token_rules (pay-блок) [15 мин]
+🔴 P2 — qwen_service_mappings (убрать _apply_food/insurance/luggage) [30 мин]
+🟡 P3 — extraction_rules унификация (единый движок для всех extraction) [1 ч]
+🟡 P3 — gen_step_token_bridges.py [2 ч]
+🟠 P4 — _is_g_service() → _is_secondary_variant(sibling_metadata) [1 ч]
+```
 
 ### Шаг 3 (P2): `_derive_optional_seeds()` из sibling_metadata
 
