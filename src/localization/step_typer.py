@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .._config import cfg_get, build_optional_re
-from ..rule_engine import RuleEngine
+from ..rule_engine import RuleEngine, TokenInjectionEngine, ComplexTokenEngine
 
 if TYPE_CHECKING:
     from src.localization.qwen_encoder import StepParams
@@ -65,7 +65,9 @@ def _load_step_rules() -> list[tuple[str, list[str]]]:
 
 _STEP_RULES: list[tuple[str, list[str]]] = _load_step_rules()
 
-_CLASSIFIER = RuleEngine(cfg_get("classification_rules", []))
+_CLASSIFIER       = RuleEngine(cfg_get("classification_rules", []))
+_TOKEN_INJECTOR   = TokenInjectionEngine(cfg_get("token_injection_rules", []))
+_COMPLEX_INJECTOR = ComplexTokenEngine(cfg_get("complex_token_rules", []))
 
 
 # ---------------------------------------------------------------------------
@@ -187,89 +189,9 @@ def _build_extra_tokens(
     action: str = "",
     step_params: "StepParams | None" = None,
 ) -> list[str]:
-    """Формирует структурные BM25-токены из параметров бронирования.
-
-    Семантический мост NL → code (action vocabulary) заменён dense-векторами
-    (SemanticReranker / BGE-M3) в src/similarity/encoder.py.
-    """
-    tokens: list[str] = []
-
-    # Структурные атрибуты бронирования: извлекаются из текста шага напрямую
-    if info.seat_class == "FIRST":
-        tokens.append("first class")
-    elif info.seat_class == "SECOND":
-        tokens.append("second class")
-
-    if info.has_food is True:
-        tokens.append("food")
-    if info.has_insurance is True:
-        tokens.append("insurance")
-    if info.has_luggage is True:
-        tokens.append("consign luggage")
-
-    # step_type-специфичные токены: усиливают нужный handler в пределах одного сервиса
-    # search_transit: "transfer"×2 + "via" → boost getTransferResult vs queryOrdersForRefresh
-    if info.step_type == "search_transit":
-        tokens.extend(["transfer", "transfer", "via"])
-    # cancel: "ticket" + "verify" → boost cancelTicket (имеет оба) vs calculate (не имеет)
-    if info.step_type == "cancel":
-        tokens.extend(["ticket", "verify"])
-    # rebook: "rebook" x2 extra → triple "rebook" в query; rebook.rebook имеет TF=3 vs payDifference TF=2
-    if info.step_type == "rebook":
-        tokens.extend(["rebook", "rebook"])
-
-    # pay: Qwen payment_mode имеет приоритет; fallback — pay_type из RuleEngine
-    if info.step_type == "pay":
-        _pm = (step_params.payment_mode if step_params is not None else "") or info.pay_type
-        if _pm == "external":
-            tokens.extend(["payment", "payment", "service"])
-        elif _pm == "internal":
-            tokens.append("inside")
-
-    # check_price: "price"×2 — усилить сигнал price vs order (queryOrdersForRefresh шумит)
-    if info.step_type == "check_price":
-        tokens.extend(["price", "price"])
-
-    # query_insurance: "assurance"×2 — boost assurance-service vs consign-service
-    # Без этого "record of the order" тянет к consign-service (findByOrderId)
-    if info.step_type == "query_insurance":
-        tokens.extend(["assurance", "assurance"])
-
-    # update_consign: "update" extra → updateConsign score > insertConsign score →
-    # разделяет update vs insert в tau-window (иначе оба в hs → insertConsign FP).
-    if info.step_type == "update_consign":
-        tokens.extend(["consign", "consign", "update"])
-    # add_consign: "insert" extra → insertConsign score > updateConsign.
-    if info.step_type == "add_consign":
-        tokens.extend(["consign", "consign", "insert"])
-    # query_consign: "account" в action → findByAccountId; иначе — общий consign query.
-    if info.step_type == "query_consign":
-        tokens.extend(["consign", "consign"])
-        if "account" in action.lower():
-            tokens.append("account")
-
-    # get_contact: "account"×2 → findContactsByAccountId wins over getContactsByContactsId.
-    # Contacts lookup in booking flow is always by account ID, not by contacts ID.
-    if info.step_type == "get_contact":
-        tokens.extend(["account", "account"])
-
-    # enter_station: "execute"×2 → executeTicket (URL has "execute" twice) wins over preserve/book handlers.
-    if info.step_type == "enter_station":
-        tokens.extend(["execute", "execute"])
-
-    # collect: "collect"×2 → collectTicket wins over executeTicket.
-    if info.step_type == "collect":
-        tokens.extend(["collect", "collect"])
-
-    # query_orders: "refresh/filter/view" → tokens ["query", "order", "orders"] →
-    # усиливает queryOrders, getAllOrders в order-service (1 overlap → 3 overlap).
-    if info.step_type == "query_orders":
-        tokens.extend(["query", "order", "orders"])
-
-    # check_refund: "calculate"×2 — boost ts-cancel-service/calculate над прочими
-    # "refund" из action уже есть в query; "calculate" добавляет прямой сигнал сервиса
-    if info.step_type == "check_refund":
-        tokens.extend(["calculate", "refund"])
+    """BM25-токены из StepInfo атрибутов — полностью data-driven из domain_config.yaml."""
+    tokens = _TOKEN_INJECTOR.collect_tokens(action, info)
+    tokens += _COMPLEX_INJECTOR.collect_tokens(info, step_params)
 
     # Qwen keywords: инжектировать только для безопасных step_types
     if (step_params is not None

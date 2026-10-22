@@ -329,6 +329,42 @@ classification_rules:
     positive_patterns: ['\binternal\b']
     negative_patterns: []
 
+# Правила инъекции BM25-токенов в запрос по значениям StepInfo полей
+# match_field: поле StepInfo; match_value: ожидаемое значение
+# text_contains: опциональный текстовый фильтр (проверяется в action.lower())
+token_injection_rules:
+  # Атрибуты бронирования → усиливают нужный сервис
+  - {match_field: seat_class,    match_value: "FIRST",  tokens: ["first class"]}
+  - {match_field: seat_class,    match_value: "SECOND", tokens: ["second class"]}
+  - {match_field: has_food,      match_value: true,     tokens: ["food"]}
+  - {match_field: has_insurance, match_value: true,     tokens: ["insurance"]}
+  - {match_field: has_luggage,   match_value: true,     tokens: ["consign luggage"]}
+  # step_type → handler disambiguation токены
+  - {match_field: step_type, match_value: search_transit,  tokens: ["transfer", "transfer", "via"]}
+  - {match_field: step_type, match_value: cancel,          tokens: ["ticket", "verify"]}
+  - {match_field: step_type, match_value: rebook,          tokens: ["rebook", "rebook"]}
+  - {match_field: step_type, match_value: check_price,     tokens: ["price", "price"]}
+  - {match_field: step_type, match_value: query_insurance, tokens: ["assurance", "assurance"]}
+  - {match_field: step_type, match_value: update_consign,  tokens: ["consign", "consign", "update"]}
+  - {match_field: step_type, match_value: add_consign,     tokens: ["consign", "consign", "insert"]}
+  - {match_field: step_type, match_value: query_consign,   tokens: ["consign", "consign"]}
+  - {match_field: step_type, match_value: query_consign,   tokens: ["account"], text_contains: "account"}
+  - {match_field: step_type, match_value: get_contact,     tokens: ["account", "account"]}
+  - {match_field: step_type, match_value: enter_station,   tokens: ["execute", "execute"]}
+  - {match_field: step_type, match_value: collect,         tokens: ["collect", "collect"]}
+  - {match_field: step_type, match_value: query_orders,    tokens: ["query", "order", "orders"]}
+  - {match_field: step_type, match_value: check_refund,    tokens: ["calculate", "refund"]}
+
+# Составные правила с приоритетным источником значения (Qwen > fallback)
+complex_token_rules:
+  - trigger_field: step_type
+    trigger_value: pay
+    priority_source: payment_mode   # step_params атрибут (Qwen)
+    fallback_field: pay_type        # StepInfo поле (из RuleEngine/classification_rules)
+    value_mapping:
+      external: ["payment", "payment", "service"]
+      internal: ["inside"]
+
 # Шумные токены при поиске auth/security кандидатов (gen_project_config.py)
 # Generic HTTP / config / bootstrap слова — не связаны с auth-логикой
 auth_namespace_noise:
