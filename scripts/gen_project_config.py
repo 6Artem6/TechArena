@@ -89,24 +89,10 @@ def derive_func_variant_suffixes(modules: list[str], prefix: str, suffix: str) -
 # NLP-базис стоп-токенов: слова слишком общие для любого проекта.
 # Доменные стоп-токены (train, order, booking и т.д.) вычисляются
 # динамически через derive_high_freq_tokens() — они специфичны для проекта.
-_TAG_STOP_BASE = frozenset({
-    "management", "retrieval", "service", "system", "operations", "data",
-    "admin", "information", "handling", "specific", "creation", "deletion",
-    "update", "access", "processing", "other", "inside", "based",
-    "record", "retrieve", "insert", "create", "delete", "batch",
-    "unique", "identifier", "existing", "available", "list",
-    "name", "type", "details", "config", "request", "lookup", "search", "query",
-    "send", "notify", "contact",
-})
-
-# Инфраструктурные токены — не optional-addon по определению.
-# Проверяется только ПЕРВЫЙ токен нормализованного имени (prefix/suffix сняты).
-# Доменные core-токены (order, travel, station и т.д.) вычисляются динамически
-# через derive_core_name_tokens() — они встречаются у >1 сервиса и специфичны для проекта.
-_CORE_INFRA_TOKENS = frozenset({
-    "auth", "security", "gateway", "common", "wait", "inside",
-    "admin", "execute", "delivery", "notification", "verification",
-})
+def _load_tag_stop_base() -> frozenset[str]:
+    """NLP baseline стоп-слова для тегов сервисов — загружаются из domain_config.yaml."""
+    from src._config import cfg_get as _cfg_get
+    return frozenset(_cfg_get("tag_stop_base", []))
 
 
 def derive_high_freq_tokens(
@@ -244,7 +230,7 @@ def derive_optional_groups_from_tags(
     # Не хардкодим доменные токены (train/order/station/…) — вычисляем из скелета.
     core_name_toks = derive_core_name_tokens(modules, prefix, suffix)
     high_freq = derive_high_freq_tokens(svc_tokens, len(modules), threshold=0.40)
-    stop_tokens: frozenset[str] = _TAG_STOP_BASE | high_freq | _CORE_INFRA_TOKENS | core_name_toks
+    stop_tokens: frozenset[str] = _load_tag_stop_base() | high_freq | core_name_toks
 
     cluster_cands = _cluster_by_token_overlap(svc_tokens, len(modules), stop_tokens)
 
@@ -305,7 +291,7 @@ def derive_optional_groups_from_tags(
 
     # Qwen шаг 2: singletons — только сервисы НЕ в кластерах и НЕ core
     # Core: infra tokens + G/OTHER pairs + high-freq name tokens
-    all_core_toks = core_name_toks | _CORE_INFRA_TOKENS | other_pair_first
+    all_core_toks = core_name_toks | other_pair_first
 
     def _is_core(mod: str) -> bool:
         norm = mod.removeprefix(prefix).removesuffix(suffix)

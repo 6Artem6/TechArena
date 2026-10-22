@@ -163,6 +163,51 @@ safe_keyword_step_types:
 # Дублировать URL path в doc_text base (усиливает TF URL-сегментов в BM25)
 duplicate_url_path: false
 
+# NLP baseline стоп-слова для кластеризации тегов сервисов (gen_project_config.py)
+# Generic English words которые появляются в Qwen-сгенерированных тегах у всех сервисов
+# но не являются domain-специфичными — нужно исключить до кластеризации
+tag_stop_base:
+  - management
+  - retrieval
+  - service
+  - system
+  - operations
+  - data
+  - admin
+  - information
+  - handling
+  - specific
+  - creation
+  - deletion
+  - update
+  - access
+  - processing
+  - other
+  - inside
+  - based
+  - record
+  - retrieve
+  - insert
+  - create
+  - delete
+  - batch
+  - unique
+  - identifier
+  - existing
+  - available
+  - list
+  - name
+  - type
+  - details
+  - config
+  - request
+  - lookup
+  - search
+  - query
+  - send
+  - notify
+  - contact
+
 # Архитектурные суффиксы-исключения (gen_project_config.py tier2)
 # Суффиксы классов слишком generic для arch-роли — встречаются у всех Spring Boot сервисов
 arch_suffix_stop:
