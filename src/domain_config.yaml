@@ -329,6 +329,14 @@ classification_rules:
     positive_patterns: ['\binternal\b']
     negative_patterns: []
 
+# Маппинг Qwen StepParams.get_service() → поля StepInfo
+# combine: any → True если хотя бы один ключ True; False если все False; None → regex fallback
+# combine: first (default) → значение первого non-None ключа
+qwen_service_mappings:
+  has_food:      {keys: [food_train, food_station], combine: any}
+  has_insurance: {keys: [insurance]}
+  has_luggage:   {keys: [luggage]}
+
 # Правила инъекции BM25-токенов в запрос по значениям StepInfo полей
 # match_field: поле StepInfo; match_value: ожидаемое значение
 # text_contains: опциональный текстовый фильтр (проверяется в action.lower())

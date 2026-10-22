@@ -222,6 +222,28 @@ complex_token_rules:
 
 Python движок: `getattr(info, rule["match_field"]) == rule["match_value"]` → `tokens.extend(rule["tokens"])`.
 
+### 🔴 Шаг 3b (P2): `qwen_service_mappings` + `_SAFE_KEYWORD_TYPES` defaults убрать
+
+**`safe_keyword_step_types`** — уже в yaml, но в Python есть hardcoded fallback defaults:  
+`frozenset(cfg_get("safe_keyword_step_types", ["book", "pay", "cancel", ...]))` → убрать список, оставить `frozenset(cfg_get("safe_keyword_step_types", []))`.
+
+**`qwen_service_mappings`** в yaml — описывает как Qwen StepParams → StepInfo поля.  
+`_apply_qwen_params(step_params, info)` читает маппинг и заполняет поля через `setattr`.
+
+```yaml
+qwen_service_mappings:
+  has_food:      {keys: [food_train, food_station], combine: any}
+  has_insurance: {keys: [insurance]}
+  has_luggage:   {keys: [luggage]}
+```
+
+**Нюанс OR-логики**: `combine: any` → has_food=True если хотя бы один ключ True;  
+has_food=False если все False; has_food=None если все None → тогда regex fallback.  
+Без этого: первый non-None wins → food_train=False, food_station=True → has_food=False (регрессия).
+
+После: `_apply_food`, `_apply_insurance`, `_apply_luggage` удаляются.  
+Regex fallback `_apply_options()` остаётся до P3 (extraction_rules унификация).
+
 ### 🔴 Шаг 4 (P2): `extraction_rules` — унифицировать все regex extraction
 
 Сейчас три источника: `classification_rules` (yaml), `optional_patterns.json` (кеш), `step_train_patterns` (yaml).  

@@ -17,11 +17,8 @@ if TYPE_CHECKING:
     from src.localization.qwen_encoder import StepParams
 
 
-_SAFE_KEYWORD_TYPES = frozenset(cfg_get("safe_keyword_step_types", [
-    "book", "pay", "cancel", "collect", "rebook",
-    "enter_station", "add_consign", "query_consign",
-    "check_price", "check_refund",
-]))
+_SAFE_KEYWORD_TYPES  = frozenset(cfg_get("safe_keyword_step_types", []))
+_QWEN_SVC_MAPPINGS   = cfg_get("qwen_service_mappings", {})
 
 
 # ---------------------------------------------------------------------------
@@ -98,31 +95,32 @@ def _apply_train_type(text: str, info: StepInfo) -> None:
         info.train_type = "OTHER"
 
 
-def _apply_food(text: str, info: StepInfo) -> None:
-    if _HAS_FOOD.search(text) and not _NO_FOOD.search(text):
-        info.has_food = True
-    elif _NO_FOOD.search(text):
-        info.has_food = False
-
-
-def _apply_insurance(text: str, info: StepInfo) -> None:
-    if _HAS_INS.search(text) and not _NO_INS.search(text):
-        info.has_insurance = True
-    elif _NO_INS.search(text):
-        info.has_insurance = False
-
-
-def _apply_luggage(text: str, info: StepInfo) -> None:
-    if _HAS_LUG.search(text) and not _NO_LUG.search(text):
-        info.has_luggage = True
-    elif _NO_LUG.search(text):
-        info.has_luggage = False
-
-
 def _apply_options(text: str, info: StepInfo) -> None:
-    _apply_food(text, info)
-    _apply_insurance(text, info)
-    _apply_luggage(text, info)
+    """Regex baseline для optional addon атрибутов (из optional_patterns.json)."""
+    _HAS = {"has_food": (_HAS_FOOD, _NO_FOOD),
+            "has_insurance": (_HAS_INS, _NO_INS),
+            "has_luggage": (_HAS_LUG, _NO_LUG)}
+    for field_name, (pos, neg) in _HAS.items():
+        if pos.search(text) and not neg.search(text):
+            setattr(info, field_name, True)
+        elif neg.search(text):
+            setattr(info, field_name, False)
+
+
+def _apply_qwen_params(step_params: "StepParams", info: StepInfo) -> None:
+    """Применяет Qwen StepParams → StepInfo по qwen_service_mappings из конфига."""
+    for field_name, cfg in _QWEN_SVC_MAPPINGS.items():
+        keys = cfg["keys"] if isinstance(cfg, dict) else [cfg]
+        combine = cfg.get("combine", "first") if isinstance(cfg, dict) else "first"
+        vals = [step_params.get_service(k) for k in keys]
+        non_none = [v for v in vals if v is not None]
+        if not non_none:
+            continue  # нет данных от Qwen → оставить regex-значение
+        if combine == "any":
+            setattr(info, field_name, any(v is True for v in vals)
+                    if any(v is True for v in vals) else False)
+        else:
+            setattr(info, field_name, non_none[0])
 
 
 def classify(action: str, step_params: "StepParams | None" = None) -> StepInfo:
@@ -152,33 +150,10 @@ def classify(action: str, step_params: "StepParams | None" = None) -> StepInfo:
             if info.step_type != "unknown":
                 break
 
+    # Regex baseline → Qwen override (если step_params доступен)
+    _apply_options(text, info)
     if step_params is not None:
-        # --- Qwen path: структурные атрибуты бронирования ---
-        # services: food_train, food_station, insurance, luggage
-        food_train   = step_params.get_service("food_train")
-        food_station = step_params.get_service("food_station")
-        if food_train is True or food_station is True:
-            info.has_food = True
-        elif food_train is False and food_station is False:
-            info.has_food = False
-        else:
-            _apply_food(text, info)
-
-        ins = step_params.get_service("insurance")
-        if ins is not None:
-            info.has_insurance = ins
-        else:
-            _apply_insurance(text, info)
-
-        lug = step_params.get_service("luggage")
-        if lug is not None:
-            info.has_luggage = lug
-        else:
-            _apply_luggage(text, info)
-
-    else:
-        # --- Regex fallback (Qwen недоступен) ---
-        _apply_options(text, info)
+        _apply_qwen_params(step_params, info)
 
     info.extra_tokens = _build_extra_tokens(info, action, step_params)
     return info
