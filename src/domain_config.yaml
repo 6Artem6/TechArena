@@ -274,6 +274,61 @@ auth_token_whitelist:
   - enabled
   - locked
 
+# ---------------------------------------------------------------------------
+# Декларативные правила классификации атрибутов шага (rule_engine.py)
+#
+# Поля target_field должны совпадать с полями StepInfo.
+# Для нового проекта: добавить правила здесь — Python-код не меняется.
+# ---------------------------------------------------------------------------
+classification_rules:
+  # --- Refused / отказ системы ---
+  - rule_id: is_refused
+    target_field: is_refused
+    target_value: true
+    priority: 10
+    group: null
+    positive_patterns: ['\bthe\s+system\s+(refuses|rejects|denies)\b']
+    negative_patterns: []
+
+  # --- Класс места ---
+  - rule_id: seat_first
+    target_field: seat_class
+    target_value: FIRST
+    priority: 20
+    group: seat_class
+    positive_patterns: ['\b(first.?class|business.?class|1st.?class)\b']
+    negative_patterns: []
+  - rule_id: seat_second
+    target_field: seat_class
+    target_value: SECOND
+    priority: 20
+    group: seat_class
+    positive_patterns: ['\b(second.?class|economy|2nd.?class|standard)\b']
+    negative_patterns: []
+
+  # --- Тип оплаты: empty > external > internal (приоритеты 30/20/10) ---
+  - rule_id: pay_empty
+    target_field: pay_type
+    target_value: external
+    priority: 30
+    group: pay_type
+    positive_patterns: ['\binternal\b.{0,50}\bempty\b']
+    negative_patterns: []
+  - rule_id: pay_external
+    target_field: pay_type
+    target_value: external
+    priority: 20
+    group: pay_type
+    positive_patterns: ['\bexternal\b']
+    negative_patterns: []
+  - rule_id: pay_internal
+    target_field: pay_type
+    target_value: internal
+    priority: 10
+    group: pay_type
+    positive_patterns: ['\binternal\b']
+    negative_patterns: []
+
 # Шумные токены при поиске auth/security кандидатов (gen_project_config.py)
 # Generic HTTP / config / bootstrap слова — не связаны с auth-логикой
 auth_namespace_noise:
