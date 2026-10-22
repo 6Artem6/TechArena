@@ -98,9 +98,91 @@ def _load_tag_stop_base() -> frozenset[str]:
 
 
 def _load_infra_module_tokens() -> frozenset[str]:
-    """First-tokens инфра-модулей — эти сервисы не являются optional addons."""
-    from src._config import cfg_get as _cfg_get
+    """First-tokens инфра-модулей — из project_config.json если есть, иначе yaml fallback."""
+    from src._config import cfg_cache_dir as _ccd, cfg_get as _cfg_get
+    import json as _j
+    pc_path = _ccd() / "project_config.json"
+    if pc_path.exists():
+        try:
+            pc = _j.loads(pc_path.read_text(encoding="utf-8"))
+            if "infra_module_tokens" in pc:
+                return frozenset(pc["infra_module_tokens"])
+        except Exception:
+            pass
     return frozenset(_cfg_get("infra_module_tokens", []))
+
+
+def derive_infra_module_tokens(
+    modules: list[str],
+    prefix: str,
+    suffix: str,
+    opt_groups: dict[str, list[str]],
+    auto_categories_path: "Path",
+    no_qwen: bool = False,
+) -> list[str]:
+    """Auto-derive infra module first_tokens: set subtraction + Qwen confirmation.
+
+    1. all_first_toks из модулей скелета
+    2. candidates = all_first - opt_group_keys - verified_cluster_toks
+    3. Qwen: из candidates отобрать только cross-cutting инфра сервисы
+    Portable: для нового репозитория не нужно угадывать инфра-список.
+    """
+    import json as _j
+
+    def _first(mod: str) -> str:
+        norm = mod.removeprefix(prefix).removesuffix(suffix).removesuffix("-other")
+        return norm.split("-")[0] if norm else ""
+
+    all_first = {_first(m) for m in modules if len(_first(m)) >= 3}
+
+    # Убрать optional group keys (food, consign, insurance — явный бизнес-домен)
+    opt_keys = set(opt_groups.keys())
+
+    # Убрать verified cluster tokens (бизнес-домен, auto-discovered)
+    cluster_toks: set[str] = set()
+    if auto_categories_path.exists():
+        try:
+            auto = _j.loads(auto_categories_path.read_text(encoding="utf-8"))
+            cluster_toks = {
+                t for cat in auto if cat.get("verified")
+                for t in cat.get("tokens", [])
+            }
+        except Exception:
+            pass
+
+    candidates = sorted(all_first - opt_keys - cluster_toks)
+    print(f"  infra candidates ({len(candidates)}): {candidates}", file=sys.stderr)
+
+    if no_qwen or not candidates:
+        return candidates
+
+    from src.localization.qwen_encoder import QwenEncoder
+    enc = QwenEncoder()
+    if not enc.enabled:
+        return candidates
+
+    prompt = (
+        f"From these microservice name tokens: {candidates}\n"
+        "Select ALL cross-cutting infrastructure tokens — services that handle technical "
+        "concerns shared across the entire application, not domain business logic.\n"
+        "Infrastructure examples: auth (authentication), gateway (API gateway), "
+        "notification (alerts/emails), execute (job execution), wait (queue/waitlist), "
+        "verification (code/captcha verification), delivery (message delivery), common (shared utils).\n"
+        "Domain business examples to EXCLUDE: order, cancel, seat, user, route, preserve, "
+        "rebook, inside, config, contacts, travel, price, admin.\n"
+        "Return JSON array of selected infrastructure tokens only."
+    )
+    schema = {"type": "array", "items": {"type": "string"}}
+    try:
+        result = enc._call_ollama(prompt, schema=schema, num_predict=100, timeout=30)
+        if isinstance(result, list):
+            valid = [t for t in result if t in set(candidates)]
+            if valid:
+                return valid
+    except Exception as e:
+        print(f"[WARN] derive_infra_module_tokens Qwen: {e}", file=sys.stderr)
+
+    return candidates
 
 
 def derive_high_freq_tokens(
@@ -661,6 +743,18 @@ def main() -> None:
         config["tier2_arch_tokens"] = arch_tokens
     if remote_tokens:
         config["tier4_remote_tokens"] = remote_tokens
+
+    # Шаг 5.5: infra_module_tokens — auto-derived из скелета + auto_categories
+    from src._config import cfg_cache_dir as _cfg_cache_dir
+    auto_cat_path = _cfg_cache_dir() / "auto_categories.json"
+    print("Вычисляю infra_module_tokens...", file=sys.stderr)
+    infra_toks = derive_infra_module_tokens(
+        modules, naming["prefix"], naming["suffix"],
+        opt_groups, auto_cat_path, no_qwen=args.no_qwen,
+    )
+    print(f"infra_module_tokens: {infra_toks}", file=sys.stderr)
+    if infra_toks:
+        config["infra_module_tokens"] = infra_toks
 
     # Сохранение
     from src._config import cfg_cache_dir

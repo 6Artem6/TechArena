@@ -213,16 +213,7 @@ tag_stop_base:
 #   1. tag_stop_base (кластеризация не по этим токенам)
 #   2. infra_core filter в gen_project_config.py (эти сервисы не попадают в singletons)
 # Критерий: один такой сервис, не является optional booking addon
-infra_module_tokens:
-  - auth
-  - security
-  - gateway
-  - common
-  - wait
-  - execute
-  - delivery
-  - notification
-  - verification
+# AUTO-GENERATED: infra_module_tokens теперь в cache/project_config.json (gen_project_config.py)
 
 # Архитектурные суффиксы-исключения (gen_project_config.py tier2)
 # Суффиксы классов слишком generic для arch-роли — встречаются у всех Spring Boot сервисов

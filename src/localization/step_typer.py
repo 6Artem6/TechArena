@@ -39,6 +39,37 @@ def _load_step_token_bridges() -> dict[str, list[str]]:
 _STEP_TOKEN_BRIDGES: dict[str, list[str]] = _load_step_token_bridges()
 
 
+def _load_auto_cluster_bridges() -> list[tuple["re.Pattern[str]", list[str]]]:
+    """Semantic expansion из cache/auto_categories.json (gen_category_clusters.py).
+
+    Verified кластер: если action содержит любой токен кластера →
+    инжектировать остальные токены кластера (synonyms expansion).
+    Graceful degradation: если кеш отсутствует — пустой список.
+    """
+    import json as _json
+    import re as _re
+    cache_path = cfg_cache_dir() / "auto_categories.json"
+    if not cache_path.exists():
+        return []
+    try:
+        cats = _json.loads(cache_path.read_text(encoding="utf-8"))
+        result = []
+        for cat in cats:
+            if not cat.get("verified"):
+                continue
+            toks = cat.get("tokens", [])
+            if len(toks) < 2:
+                continue
+            combined = "|".join(rf"\b{re.escape(t)}\b" for t in toks)
+            result.append((_re.compile(combined, _re.I), toks))
+        return result
+    except Exception:
+        return []
+
+
+_AUTO_CLUSTER_BRIDGES: list[tuple["re.Pattern[str]", list[str]]] = _load_auto_cluster_bridges()
+
+
 def _load_step_rules() -> list[tuple[str, list[str]]]:
     """Загрузить правила fallback для step_type из конфига."""
     raw = cfg_get("step_rules", [])
