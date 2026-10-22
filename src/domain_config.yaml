@@ -281,6 +281,49 @@ auth_token_whitelist:
 # Для нового проекта: добавить правила здесь — Python-код не меняется.
 # ---------------------------------------------------------------------------
 classification_rules:
+  # --- Тип поезда: NOT_G (30) > G (20) > OTHER (10) ---
+  # NOT_G имеет наивысший приоритет: "not high-speed" → OTHER, не G
+  - rule_id: train_not_g
+    target_field: train_type
+    target_value: OTHER
+    priority: 30
+    group: train_type
+    positive_patterns:
+      - '\bnot\s+high.?speed\b'
+      - '\bregular\s+train\b'
+      - 'other\b.{0,30}\btype'
+    negative_patterns: []
+  - rule_id: train_g
+    target_field: train_type
+    target_value: G
+    priority: 20
+    group: train_type
+    positive_patterns:
+      - '\bhigh.?speed\b'
+      - '\bgaotie\b'
+      - '\bgao.?tie\b'
+      - '\bg.?train\b'
+      - '\bg-?\s*type\b'
+      - '\bdongche\b'
+      - '\bdong.?che\b'
+      - '\bd.?train\b'
+      - '\bd-?\s*type\b'
+      - '\bcrh\b'
+      - '\bbullet\b'
+    negative_patterns: []
+  - rule_id: train_other
+    target_field: train_type
+    target_value: OTHER
+    priority: 10
+    group: train_type
+    positive_patterns:
+      - '\bregular\b'
+      - "'?other'?\\s*type"
+      - '\bnon.?high.?speed\b'
+      - '\bslow\b'
+      - '\bnormal\s+train\b'
+    negative_patterns: []
+
   # --- Refused / отказ системы ---
   - rule_id: is_refused
     target_field: is_refused

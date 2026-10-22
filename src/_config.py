@@ -52,6 +52,55 @@ def build_optional_re(key: str) -> "re.Pattern[str]":
     raise ValueError(f"optional_service_patterns.{key} не найден (ни в кеше, ни в YAML)")
 
 
+def load_optional_classification_rules() -> list[dict]:
+    """Конвертировать optional_patterns.json → classification_rules формат.
+
+    Пары has_X / no_X → два правила per field:
+      no_X  (priority 20, group=has_X): positive_patterns=[no_pat]  → target_value=False
+      has_X (priority 10, group=has_X): positive_patterns=[has_pat] → target_value=True
+
+    False побеждает True через приоритет: явный «no food» перекрывает «with food».
+    При отсутствии кеша возвращает пустой список (graceful degradation).
+    """
+    import json as _json
+
+    cache_file = cfg_cache_dir() / "optional_patterns.json"
+    if not cache_file.exists():
+        return []
+    try:
+        data = _json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    rules: list[dict] = []
+    for has_key in (k for k in data if k.startswith("has_")):
+        suffix = has_key[4:]          # "food", "insurance", "luggage"
+        no_key = f"no_{suffix}"
+        has_pat = data.get(has_key, "")
+        no_pat  = data.get(no_key,  "")
+        if no_pat:
+            rules.append({
+                "rule_id":          f"{has_key}_false",
+                "target_field":     has_key,
+                "target_value":     False,
+                "priority":         20,
+                "group":            has_key,
+                "positive_patterns": [no_pat],
+                "negative_patterns": [],
+            })
+        if has_pat:
+            rules.append({
+                "rule_id":          f"{has_key}_true",
+                "target_field":     has_key,
+                "target_value":     True,
+                "priority":         10,
+                "group":            has_key,
+                "positive_patterns": [has_pat],
+                "negative_patterns": [],
+            })
+    return rules
+
+
 def _load() -> dict[str, Any]:
     global _cfg
     if _cfg is not None:
