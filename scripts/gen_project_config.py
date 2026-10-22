@@ -119,13 +119,17 @@ def derive_infra_module_tokens(
     opt_groups: dict[str, list[str]],
     auto_categories_path: "Path",
     no_qwen: bool = False,
+    passport_path: "Path | None" = None,
 ) -> list[str]:
     """Auto-derive infra module first_tokens: set subtraction + Qwen confirmation.
 
     1. all_first_toks из модулей скелета
     2. candidates = all_first - opt_group_keys - verified_cluster_toks
     3. Qwen: из candidates отобрать только cross-cutting инфра сервисы
-    Portable: для нового репозитория не нужно угадывать инфра-список.
+
+    passport_path — project_passport.json для domain context в промпте.
+    Если передан: EXCLUDE список строится динамически из уже найденных бизнес-токенов,
+    хардкоженный список заменяется. Portable для новых репозиториев.
     """
     import json as _j
 
@@ -161,15 +165,39 @@ def derive_infra_module_tokens(
     if not enc.enabled:
         return candidates
 
+    # Domain context из паспорта (если доступен)
+    domain_prefix = ""
+    if passport_path and Path(passport_path).exists():
+        try:
+            pp = _j.loads(Path(passport_path).read_text(encoding="utf-8"))
+            domain = pp.get("domain", "")
+            features = pp.get("main_features", [])
+            if domain:
+                domain_prefix = f"This is a {domain} system."
+                if features:
+                    domain_prefix += " Business features: " + "; ".join(features[:3]) + "."
+                domain_prefix += "\n"
+        except Exception:
+            pass
+
+    # Dynamic EXCLUDE: токены которые уже классифицированы как бизнес-домен
+    # (opt_keys + cluster_toks пересечённые с all_first — всё что мы отсеяли)
+    domain_exclude = sorted((opt_keys | cluster_toks) & all_first)
+    if domain_exclude:
+        exclude_str = ", ".join(domain_exclude[:12])
+    else:
+        # Fallback: generic domain examples
+        exclude_str = "order, cancel, seat, user, route, preserve, rebook, inside, contacts, travel"
+
     prompt = (
+        f"{domain_prefix}"
         f"From these microservice name tokens: {candidates}\n"
         "Select ALL cross-cutting infrastructure tokens — services that handle technical "
         "concerns shared across the entire application, not domain business logic.\n"
         "Infrastructure examples: auth (authentication), gateway (API gateway), "
         "notification (alerts/emails), execute (job execution), wait (queue/waitlist), "
         "verification (code/captcha verification), delivery (message delivery), common (shared utils).\n"
-        "Domain business examples to EXCLUDE: order, cancel, seat, user, route, preserve, "
-        "rebook, inside, config, contacts, travel, price, admin.\n"
+        f"Domain business examples to EXCLUDE: {exclude_str}.\n"
         "Return JSON array of selected infrastructure tokens only."
     )
     schema = {"type": "array", "items": {"type": "string"}}
@@ -747,10 +775,12 @@ def main() -> None:
     # Шаг 5.5: infra_module_tokens — auto-derived из скелета + auto_categories
     from src._config import cfg_cache_dir as _cfg_cache_dir
     auto_cat_path = _cfg_cache_dir() / "auto_categories.json"
+    passport_path = _cfg_cache_dir() / "project_passport.json"
     print("Вычисляю infra_module_tokens...", file=sys.stderr)
     infra_toks = derive_infra_module_tokens(
         modules, naming["prefix"], naming["suffix"],
         opt_groups, auto_cat_path, no_qwen=args.no_qwen,
+        passport_path=passport_path,
     )
     print(f"infra_module_tokens: {infra_toks}", file=sys.stderr)
     if infra_toks:

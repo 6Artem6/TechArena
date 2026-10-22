@@ -309,8 +309,32 @@ class QwenEncoder:
         self._cache_lock = threading.Lock()
         self._language = _detect_language(targets_root)
         self._system, self._user_tmpl = _build_prompts(self._language)
+        self._domain_context = self._load_domain_context()
         self._backend, self.enabled = self._init_backend()
         self._cache_dirty = False
+
+    @staticmethod
+    def _load_domain_context() -> str:
+        """Загрузить domain context из project_passport.json для classify_step()."""
+        try:
+            from src._config import cfg_cache_dir
+            pp_path = cfg_cache_dir() / "project_passport.json"
+            if not pp_path.exists():
+                return ""
+            pp = json.loads(pp_path.read_text(encoding="utf-8"))
+            domain = pp.get("domain", "")
+            features = pp.get("main_features", [])
+            parts: list[str] = []
+            if domain:
+                parts.append(f"System context: {domain}.")
+            if features:
+                parts.append("Business features: " + "; ".join(features[:3]) + ".")
+            ctx = " ".join(parts)
+            if ctx:
+                print(f"[qwen] domain context loaded: {domain[:50]}", file=sys.stderr)
+            return ctx
+        except Exception:
+            return ""
 
     @staticmethod
     def _load_cache() -> "dict[tuple, object]":
@@ -504,12 +528,16 @@ class QwenEncoder:
             return StepParams()
 
         prompt = f'Action: "{action}"\n\nJSON:'
+        classify_system = (
+            (self._domain_context + "\n\n" + _CLASSIFY_SYSTEM)
+            if self._domain_context else _CLASSIFY_SYSTEM
+        )
         try:
             if self._backend == "ollama":
                 raw = self._call_ollama(
                     prompt,
                     schema=_CLASSIFY_SCHEMA,
-                    system=_CLASSIFY_SYSTEM,
+                    system=classify_system,
                     num_predict=_CLASSIFY_NUM_PREDICT,
                 )
             elif self._backend == "transformers":
