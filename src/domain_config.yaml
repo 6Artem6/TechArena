@@ -348,6 +348,42 @@ classification_rules:
     group: seat_class
     positive_patterns: ['\b(second.?class|economy|2nd.?class|standard)\b']
     negative_patterns: []
+  # --- Дополнительные классы мест (сгенерировано gen_classification_rules.py) ---
+  - rule_id: seat_hard_seat
+    target_field: seat_class
+    target_value: HARDSEAT
+    priority: 20
+    group: seat_class
+    positive_patterns: ['\bhard\s+seat\b']
+    negative_patterns: []
+  - rule_id: seat_soft_seat
+    target_field: seat_class
+    target_value: SOFTSEAT
+    priority: 20
+    group: seat_class
+    positive_patterns: ['\bsoft\s+seat\b']
+    negative_patterns: []
+  - rule_id: seat_hard_bed
+    target_field: seat_class
+    target_value: HARDBED
+    priority: 20
+    group: seat_class
+    positive_patterns: ['\b(hard\s+sleeper|hard\s+bed)\b']
+    negative_patterns: []
+  - rule_id: seat_soft_bed
+    target_field: seat_class
+    target_value: SOFTBED
+    priority: 20
+    group: seat_class
+    positive_patterns: ['\b(soft\s+sleeper|soft\s+bed)\b']
+    negative_patterns: []
+  - rule_id: seat_high_soft_bed
+    target_field: seat_class
+    target_value: HIGHSOFTBED
+    priority: 20
+    group: seat_class
+    positive_patterns: ['\b(high\s+soft\s+bed|premium\s+sleeper)\b']
+    negative_patterns: []
 
   # --- Тип оплаты: empty > external > internal (приоритеты 30/20/10) ---
   - rule_id: pay_empty
@@ -385,8 +421,13 @@ qwen_service_mappings:
 # text_contains: опциональный текстовый фильтр (проверяется в action.lower())
 token_injection_rules:
   # Атрибуты бронирования → усиливают нужный сервис
-  - {match_field: seat_class,    match_value: "FIRST",  tokens: ["first class"]}
-  - {match_field: seat_class,    match_value: "SECOND", tokens: ["second class"]}
+  - {match_field: seat_class, match_value: "FIRST",     tokens: ["first class"]}
+  - {match_field: seat_class, match_value: "SECOND",    tokens: ["second class"]}
+  - {match_field: seat_class, match_value: "HARDSEAT",  tokens: ["hard seat"]}
+  - {match_field: seat_class, match_value: "SOFTSEAT",  tokens: ["soft seat"]}
+  - {match_field: seat_class, match_value: "HARDBED",   tokens: ["hard sleeper"]}
+  - {match_field: seat_class, match_value: "SOFTBED",   tokens: ["soft sleeper"]}
+  - {match_field: seat_class, match_value: "HIGHSOFTBED", tokens: ["high soft bed"]}
   - {match_field: has_food,      match_value: true,     tokens: ["food"]}
   - {match_field: has_insurance, match_value: true,     tokens: ["insurance"]}
   - {match_field: has_luggage,   match_value: true,     tokens: ["consign luggage"]}

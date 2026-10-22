@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .._config import cfg_get, load_optional_classification_rules
+from .._config import cfg_get, cfg_cache_dir, load_optional_classification_rules
 from ..rule_engine import RuleEngine, TokenInjectionEngine, ComplexTokenEngine
 
 if TYPE_CHECKING:
@@ -19,6 +19,24 @@ if TYPE_CHECKING:
 
 _SAFE_KEYWORD_TYPES = frozenset(cfg_get("safe_keyword_step_types", []))
 _QWEN_SVC_MAPPINGS  = cfg_get("qwen_service_mappings", {})
+
+
+def _load_step_token_bridges() -> dict[str, list[str]]:
+    """Загрузить BM25 co-occurrence bridges из кеша (gen_step_token_bridges.py).
+
+    Возвращает {} если кеш отсутствует — graceful degradation.
+    """
+    import pickle as _pickle
+    cache_path = cfg_cache_dir() / "step_token_bridges.pkl"
+    if not cache_path.exists():
+        return {}
+    try:
+        return _pickle.loads(cache_path.read_bytes())
+    except Exception:
+        return {}
+
+
+_STEP_TOKEN_BRIDGES: dict[str, list[str]] = _load_step_token_bridges()
 
 
 def _load_step_rules() -> list[tuple[str, list[str]]]:
