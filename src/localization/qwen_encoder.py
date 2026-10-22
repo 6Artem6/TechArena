@@ -86,79 +86,127 @@ class QwenOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Pass 1: classify-only output — StepParams (структурированный контракт шага)
+# Pass 1: classify-only output — StepParams (доменно-независимая схема)
 # ---------------------------------------------------------------------------
 
-class ServiceItem(BaseModel):
-    """Явно упомянутый сервис в тексте шага."""
-    name: str     # food_train | food_station | insurance | luggage
-    present: bool
+class FeatureItem(BaseModel):
+    """Опциональный addon/модификатор, явно упомянутый в тексте шага."""
+    name: str   # food_train | food_station | insurance | luggage | ...
+    state: bool # True = присутствует / включён, False = явно отсутствует
+
+# Обратная совместимость — старое имя ServiceItem и поле present
+ServiceItem = FeatureItem
+
+
+class FilterItem(BaseModel):
+    """Структурированный фильтр для search/query шагов."""
+    key: str    # status | date | ...
+    value: str  # Paid | Cancel | travel | purchase | ...
 
 
 class StepParams(BaseModel):
-    """Результат Pass 1: полный структурированный контракт шага.
+    """Результат Pass 1: агностический контракт шага.
 
-    Заменяет regex-based классификацию в step_typer.py.
-    Все поля выводятся Qwen из natural language текста шага.
+    Не содержит доменных полей — вся доменная семантика переносится
+    в attributes (key-value) и features (boolean flags).
+    Маппинг attributes/features → StepInfo выполняется в step_typer.py
+    через qwen_service_mappings из domain_config.yaml.
     """
-    step_type:       str              = Field(default="other")
-    train_type:      str              = Field(default="")    # "G" | "OTHER" | ""
-    seat_class:      str              = Field(default="")    # "FIRST" | "SECOND" | ""
-    services:        list[ServiceItem] = Field(default_factory=list)
-    payment_mode:    str              = Field(default="")    # "internal" | "external" | ""
-    search_criteria: list[str]        = Field(default_factory=list)  # cheapest/quickest/fewest_stops/transfer
-    order_filter:    str              = Field(default="")    # "status:Paid" | "status:Cancel" | "date:travel" | ""
-    actor_role:      str              = Field(default="")    # "passenger" | "admin" | ""
-    keywords:        list[str]        = Field(default_factory=list)   # BM25 extra terms
+    step_type:      str              = Field(default="other")
+    actor_role:     str              = Field(default="")
+    keywords:       list[str]        = Field(default_factory=list)
+    attributes:     dict[str, str]   = Field(default_factory=dict)
+    features:       list[FeatureItem] = Field(default_factory=list)
+    search_filters: list[FilterItem]  = Field(default_factory=list)
 
     @classmethod
     def from_raw(cls, raw: dict) -> "StepParams":
+        """Парсинг с поддержкой старого формата (cls_v3 кеш) для плавного перехода."""
+        if not isinstance(raw, dict):
+            return cls()
+        raw = dict(raw)  # копия, не мутируем исходник
+
+        # Конвертация старого формата (pre-v4): services[{name, present}] → features[{name, state}]
+        if "services" in raw and "features" not in raw:
+            svcs = raw.pop("services") or []
+            raw["features"] = [
+                {"name": s.get("name", ""), "state": s.get("present", False)}
+                for s in svcs if s.get("name")
+            ]
+
+        # Конвертация старых typed полей → attributes
+        attrs: dict[str, str] = dict(raw.pop("attributes", None) or {})
+        for old_field in ("train_type", "seat_class", "payment_mode", "order_filter"):
+            val = raw.pop(old_field, None)
+            if val and old_field not in attrs:
+                attrs[old_field] = str(val)
+        sc = raw.pop("search_criteria", None)
+        if sc and "search_criteria" not in attrs:
+            attrs["search_criteria"] = ",".join(sc) if isinstance(sc, list) else str(sc)
+        if attrs:
+            raw["attributes"] = attrs
+
         try:
             return cls.model_validate(raw)
         except Exception:
             st = str(raw.get("step_type", "other")).strip() or "other"
             return cls(step_type=st)
 
-    def get_service(self, name: str) -> "bool | None":
-        """True/False если сервис явно упомянут, None если нет данных."""
-        for svc in self.services:
-            if svc.name == name:
-                return svc.present
+    def get_feature(self, name: str) -> "bool | None":
+        """True/False если feature явно упомянута, None если нет данных."""
+        for f in self.features:
+            if f.name == name:
+                return f.state
         return None
+
+    def get_service(self, name: str) -> "bool | None":
+        """Alias для get_feature() — обратная совместимость."""
+        return self.get_feature(name)
 
 
 # Обратная совместимость: старое имя класса → StepParams
 QwenClassifyOutput = StepParams
 
 
-_CLASSIFY_SCHEMA = {
+_AGNOSTIC_CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {
-        "step_type":       {"type": "string"},
-        "train_type":      {"type": "string"},
-        "seat_class":      {"type": "string"},
-        "services": {
+        "step_type":   {"type": "string"},
+        "actor_role":  {"type": "string"},
+        "keywords":    {"type": "array", "items": {"type": "string"}},
+        "attributes": {
+            "type": "object",
+            "description": "Domain-specific key-value modifiers",
+            "additionalProperties": {"type": "string"},
+        },
+        "features": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "name":    {"type": "string"},
-                    "present": {"type": "boolean"},
+                    "name":  {"type": "string"},
+                    "state": {"type": "boolean"},
                 },
-                "required": ["name", "present"],
+                "required": ["name", "state"],
             },
         },
-        "payment_mode":    {"type": "string"},
-        "search_criteria": {"type": "array", "items": {"type": "string"}},
-        "order_filter":    {"type": "string"},
-        "actor_role":      {"type": "string"},
-        "keywords":        {"type": "array", "items": {"type": "string"}},
+        "search_filters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key":   {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["key", "value"],
+            },
+        },
     },
-    "required": [
-        "step_type", "train_type", "seat_class", "services",
-        "payment_mode", "search_criteria", "order_filter", "actor_role", "keywords",
-    ],
+    "required": ["step_type", "keywords", "attributes", "features"],
 }
+
+# Alias для обратной совместимости внутри файла
+_CLASSIFY_SCHEMA = _AGNOSTIC_CLASSIFY_SCHEMA
 
 # =============================================================================
 # classify_step() system prompt — две части: шаблон и builder
@@ -177,69 +225,66 @@ _CLASSIFY_SYSTEM_TEMPLATE = (
     "  query_consign, add_consign, update_consign, add_contact, get_contact,\n"
     "  browse_food_station, query_food_trip, check_price, check_refund, query_insurance,\n"
     "  enter_station, admin_login, add_station, add_train_type, add_route, add_trip, add_price, other\n\n"
-    "train_type: \"G\" (high-speed/bullet/gaotie/CRH/DongChe/D-type), "
-    "\"OTHER\" (regular/slow/non-high-speed), \"\" (unknown)\n"
-    "seat_class: \"FIRST\" (first-class/business), \"SECOND\" (second-class/economy), \"\" (unknown)\n"
-    "{services_block}\n"
-    "payment_mode: \"internal\" (internal balance), \"external\" (external service/balance empty), \"\" (unknown)\n"
-    "search_criteria: mention any of: cheapest, quickest, fewest_stops, transfer\n"
-    "order_filter: \"status:Paid\", \"status:Cancel\", \"date:travel\", \"date:purchase\", or \"\"\n"
     "actor_role: \"admin\" (admin context), \"passenger\" (user context), \"\" (unknown)\n"
     "keywords: 0-3 BM25 terms for finding the API handler (no city names, no train numbers)\n\n"
+    "attributes: key-value pairs for detected domain-specific modifiers (omit if unknown/empty):\n"
+    "  train_type → \"G\" (high-speed/bullet/CRH/DongChe) | \"OTHER\" (regular/slow)\n"
+    "  seat_class → \"FIRST\" (first-class/business) | \"SECOND\" (second-class/economy)\n"
+    "  payment_mode → \"internal\" (internal balance) | \"external\" (external service)\n"
+    "  search_criteria → comma-sep: cheapest, quickest, fewest_stops, transfer (if any)\n\n"
+    "{features_block}\n"
+    "search_filters: structured filters for query/search steps:\n"
+    "  [{\"key\":\"status\",\"value\":\"Paid\"}, {\"key\":\"date\",\"value\":\"travel\"}] or []\n\n"
     "RULES:\n"
     "  search_transit = ONLY when transfer/connection/via/layover explicitly mentioned\n"
     "  search_advanced = cheapest/quickest/fewest-stops (no transfer)\n"
-    "  services: omit unmentioned services (keep array short)\n"
+    "  features: omit unmentioned items (keep array short)\n"
+    "  attributes: omit keys with empty/unknown values\n"
     "  keywords: for pay add payment signal; for book add seat/service signals; skip for search\n\n"
     "Examples:\n"
     '  "book first-class with food on train and insurance" → '
-    '{"step_type":"book","train_type":"","seat_class":"FIRST",'
-    '"services":[{"name":"food_train","present":true},{"name":"insurance","present":true}],'
-    '"payment_mode":"","search_criteria":[],"order_filter":"","actor_role":"passenger",'
-    '"keywords":["first class","food","insurance"]}\n'
+    '{"step_type":"book","actor_role":"passenger","keywords":["first class","food","insurance"],'
+    '"attributes":{"seat_class":"FIRST"},'
+    '"features":[{"name":"food_train","state":true},{"name":"insurance","state":true}],'
+    '"search_filters":[]}\n'
     '  "pay using internal account balance" → '
-    '{"step_type":"pay","train_type":"","seat_class":"",'
-    '"services":[],"payment_mode":"internal","search_criteria":[],"order_filter":"","actor_role":"",'
-    '"keywords":["inside"]}\n'
+    '{"step_type":"pay","actor_role":"","keywords":["inside"],'
+    '"attributes":{"payment_mode":"internal"},"features":[],"search_filters":[]}\n'
     '  "pay using external payment service" → '
-    '{"step_type":"pay","train_type":"","seat_class":"",'
-    '"services":[],"payment_mode":"external","search_criteria":[],"order_filter":"","actor_role":"",'
-    '"keywords":["payment","service"]}\n'
+    '{"step_type":"pay","actor_role":"","keywords":["payment","service"],'
+    '"attributes":{"payment_mode":"external"},"features":[],"search_filters":[]}\n'
     '  "advanced search: cheapest G-train trips" → '
-    '{"step_type":"search_advanced","train_type":"G","seat_class":"",'
-    '"services":[],"payment_mode":"","search_criteria":["cheapest"],"order_filter":"","actor_role":"",'
-    '"keywords":[]}\n'
+    '{"step_type":"search_advanced","actor_role":"","keywords":[],'
+    '"attributes":{"train_type":"G","search_criteria":"cheapest"},"features":[],"search_filters":[]}\n'
     '  "ask for trips with a transfer via Suzhou" → '
-    '{"step_type":"search_transit","train_type":"","seat_class":"",'
-    '"services":[],"payment_mode":"","search_criteria":["transfer"],"order_filter":"","actor_role":"",'
-    '"keywords":["transfer"]}\n'
+    '{"step_type":"search_transit","actor_role":"","keywords":["transfer"],'
+    '"attributes":{"search_criteria":"transfer"},"features":[],"search_filters":[]}\n'
     '  "query G-train orders (status: Paid)" → '
-    '{"step_type":"query_orders","train_type":"G","seat_class":"",'
-    '"services":[],"payment_mode":"","search_criteria":[],"order_filter":"status:Paid","actor_role":"",'
-    '"keywords":[]}\n'
+    '{"step_type":"query_orders","actor_role":"","keywords":[],'
+    '"attributes":{"train_type":"G"},"features":[],"search_filters":[{"key":"status","value":"Paid"}]}\n'
     "Output ONLY valid JSON. No other text."
 )
 
-# ── Собирается: services block из project_config.json ────────────────────────
-# optional_service_groups → какие optional services есть в этом проекте.
+# ── Собирается: features block из project_config.json ────────────────────────
+# optional_service_groups → какие optional features есть в этом проекте.
 # Описания из domain_config.yaml:classify_service_descriptions (вручную, краткий словарь).
 # Если группа не в словаре → используется group_name as-is.
 
-_SERVICES_BLOCK_FALLBACK = (
-    "services: list ONLY explicitly mentioned services:\n"
+_FEATURES_BLOCK_FALLBACK = (
+    "features: list ONLY explicitly mentioned optional addons:\n"
     "  food_train (food on the train), food_station (food at the station),\n"
-    "  insurance/assurance, luggage/consign — each as {name, present:true/false}"
+    "  insurance/assurance, luggage/consign — each as {name, state:true/false}"
 )
 
 
-def _build_services_block(optional_groups: dict) -> str:
-    """services поле — из project_config.json:optional_service_groups.
+def _build_features_block(optional_groups: dict) -> str:
+    """features поле — из project_config.json:optional_service_groups.
 
     Описания берутся из domain_config.yaml:classify_service_descriptions.
     Если кеш недоступен → возвращает hardcoded fallback.
     """
     if not optional_groups:
-        return _SERVICES_BLOCK_FALLBACK
+        return _FEATURES_BLOCK_FALLBACK
 
     try:
         from src._config import cfg_get as _cfg_get
@@ -252,34 +297,32 @@ def _build_services_block(optional_groups: dict) -> str:
         desc = descs.get(group, f"{group} service")
         lines.append(f"  {desc}")
 
-    services_str = ",\n".join(lines)
+    features_str = ",\n".join(lines)
     return (
-        f"services: list ONLY explicitly mentioned services:\n"
-        f"{services_str}\n"
-        f"  — each as {{name, present:true/false}}"
+        f"features: list ONLY explicitly mentioned optional addons:\n"
+        f"{features_str}\n"
+        f"  — each as {{name, state:true/false}}"
     )
 
 
 def _build_classify_system(domain_context: str, optional_groups: dict) -> str:
     """Собрать системный промпт classify_step() из двух частей:
 
-    1. domain_context (из project_passport.json) — system name + features
-    2. _CLASSIFY_SYSTEM_TEMPLATE (вручную) — поля, rules, examples
-       с {services_block} заполненным из optional_service_groups
+    1. domain_context (из project_passport.json + auto_categories.json)
+    2. _CLASSIFY_SYSTEM_TEMPLATE (вручную) с {features_block} из optional_service_groups
     """
-    # system_name: "Travel Management System" → "Travel Management System"
     system_name = "microservice"
     if domain_context:
         raw = domain_context.split("System context:")[-1].split(".")[0].strip()
         if raw:
             system_name = raw
 
-    services_block = _build_services_block(optional_groups)
+    features_block = _build_features_block(optional_groups)
 
     body = (
         _CLASSIFY_SYSTEM_TEMPLATE
         .replace("{system_name}", system_name)
-        .replace("{services_block}", services_block)
+        .replace("{features_block}", features_block)
     )
 
     return (f"{domain_context}\n\n" + body) if domain_context else body
@@ -631,7 +674,7 @@ class QwenEncoder:
         Не требует списка кандидатов → можно запускать параллельно до Pass 2.
         Результат кешируется по тексту шага (ключ cls_v2).
         """
-        cache_key = ("cls_v3", action)
+        cache_key = ("cls_v4", action)
         cached = self._cache.get(cache_key)
         if isinstance(cached, StepParams):
             return cached
@@ -680,7 +723,7 @@ class QwenEncoder:
         uncached_indices: list[int] = []
 
         for i, action in enumerate(actions):
-            cached = self._cache.get(("cls_v3", action))
+            cached = self._cache.get(("cls_v4", action))
             if isinstance(cached, StepParams):
                 results[i] = cached
             else:
