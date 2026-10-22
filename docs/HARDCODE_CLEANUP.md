@@ -222,7 +222,7 @@ complex_token_rules:
 
 Python движок: `getattr(info, rule["match_field"]) == rule["match_value"]` → `tokens.extend(rule["tokens"])`.
 
-### 🔴 Шаг 3b (P2): `qwen_service_mappings` + `_SAFE_KEYWORD_TYPES` defaults убрать
+### ✅ Шаг 3b (P2): `qwen_service_mappings` + `_SAFE_KEYWORD_TYPES` defaults убраны — коммит 926d0c3
 
 **`safe_keyword_step_types`** — уже в yaml, но в Python есть hardcoded fallback defaults:  
 `frozenset(cfg_get("safe_keyword_step_types", ["book", "pay", "cancel", ...]))` → убрать список, оставить `frozenset(cfg_get("safe_keyword_step_types", []))`.
@@ -276,10 +276,10 @@ offline BM25 co-occurrence: `scripts/gen_step_token_bridges.py` → `cache/step_
 
 ```
 ✅ P1 — RuleEngine + 6 констант (сделано, коммиты c8e9f87, 6318edb)
-🔴 P2 — token_injection_rules (убрать _build_extra_tokens if-блоки, ~40 строк) [30 мин]
-🔴 P2 — complex_token_rules (pay-блок) [15 мин]
-🔴 P2 — qwen_service_mappings (убрать _apply_food/insurance/luggage) [30 мин]
-🟡 P3 — extraction_rules унификация (единый движок для всех extraction) [1 ч]
+✅ P2 — token_injection_rules (убраны _build_extra_tokens if-блоки) — коммит 86e1f34
+✅ P2 — complex_token_rules (pay-блок) — коммит 86e1f34
+✅ P2 — qwen_service_mappings (убраны _apply_food/insurance/luggage) — коммит 926d0c3
+✅ P2 — _apply_train_type/_apply_options/_HAS_*/_NO_* → classification_rules — коммит 0a7f80f
 🟡 P3 — gen_step_token_bridges.py [2 ч]
 🟠 P4 — _is_g_service() → _is_secondary_variant(sibling_metadata) [1 ч]
 ```
@@ -303,3 +303,50 @@ offline BM25 co-occurrence: `scripts/gen_step_token_bridges.py` → `cache/step_
 - `tier2/tier4` токены — генерируются из скелета ✅
 - `excluded_modules` логика — читает из `optional_service_groups` ✅
 - FSM transitions (can_pay/can_cancel) — domain-specific но не hardcode в плохом смысле, это правильная бизнес-логика
+
+---
+
+## Аудит источников данных
+
+Разграничение: что генерируется автоматически (из скелета / Qwen) vs что внесено вручную — и почему.
+
+### Генерируется автоматически из скелета / Qwen
+
+| Файл/ключ | Скрипт | Что делает Qwen | Почему нельзя без Qwen |
+|-----------|--------|-----------------|------------------------|
+| `cache/optional_patterns.json` | `gen_optional_patterns.py` | Генерирует NL regex для `has_food`/`no_food` и т.д. по именам методов и полей | Паттерны зависят от того как называются optional сервисы в конкретном проекте |
+| `cache/project_config.json` → `optional_service_groups` | `gen_project_config.py` | Кластеризует теги сервисов, выбирает optional addon группы (food/insurance/luggage) | Структура опциональных сервисов неизвестна без анализа тегов |
+| `cache/project_config.json` → `optional_feature_tokens` | `gen_project_config.py` | Singletons — сервисы не в кластерах, классифицируются Qwen | Сервисы типа ts-order без явной group-принадлежности |
+| `cache/project_config.json` → `tier2_arch_tokens` | `gen_project_config.py` | Архитектурные роли (controller, repository, ...) из частых токенов | Набор ролей зависит от фреймворка и naming conventions проекта |
+| `cache/project_config.json` → `tier4_remote_tokens` | `gen_project_config.py` | Инфра-токены аутентификации (jwt, bearer, ...) | Зависит от auth-библиотек конкретного проекта |
+| `cache/sibling_metadata.json` | `gen_sibling_metadata.py` | Определяет кто PRIMARY в G/OTHER паре (ts-order vs ts-admin-order) | Эвристик по имени достаточно для суффикса `admin`, но Qwen нужен для numeric/trigram пар |
+| `cache/service_passports.pkl` | `gen_service_profiles.py` | Бизнес-описания методов per controller file (Pass 1) | Без NL-описаний BM25 работает только с code-токенами |
+| `cache/project_profile.json` + теги | `gen_service_profiles.py` | Теги сервисов через Qwen 1.5b (food, logistics, ...) | Теги нужны для кластеризации в `optional_service_groups` |
+| `cache/fsm_transitions.json` conditions | `gen_fsm_conditions.py` | Анализирует тело Java-метода: является ли вызов downstream условным | AST-анализ условных ветвей требует понимания логики |
+| `qwen_encoder_cache.pkl` | `warm_qwen_classify_cache.py` | Classify step actions → step_type (book/pay/cancel/...) | NL-текст шагов → тип — семантическое понимание |
+
+**Чисто детерминированные** (без Qwen, только граф/AST):
+
+| Файл | Скрипт | Метод |
+|------|--------|-------|
+| `cache/fsm_transitions.json` (граф) | `gen_fsm_transitions.py` | Transitive closure через calls + overrides рёбра скелета |
+| `cache/sibling_metadata.json` (g_other пары) | `gen_sibling_metadata.py` | Эвристики по суффиксу имени (`-admin-`, numeric suffix) |
+| `cache/project_config.json` → `func_variant_suffixes` | `gen_project_config.py` | Детерминированный анализ суффиксов имён методов |
+| `cache/project_config.json` → `service_naming` | `gen_project_config.py` | Prefix/suffix из имён модулей |
+
+### Внесено вручную в `domain_config.yaml`
+
+| Ключ | Причина | Можно ли автоматизировать |
+|------|---------|--------------------------|
+| `classification_rules` → `train_type` (G/OTHER/NOT_G) | **Межпроектная логика**: D-train → G disambiguation — намеренный трюк конкретно для trainticket (DongChe классифицируется иначе в step_typer vs oracle). Паттерны не выводятся из скелета. | Нет — семантика G/OTHER специфична для ЖД домена |
+| `classification_rules` → `is_refused`, `seat_class`, `pay_type` | **Не смогли автоматизировать без разметки**: `gen_classification_rules.py` генерирует их через Qwen из enum values, но результат нестабилен. Текущие правила — верифицированный baseline. | Частично через `gen_classification_rules.py`, но требует ревизии |
+| `token_injection_rules` | **Не смогли автоматизировать**: маппинг step_type → BM25 tokens требует знания топологии обработчиков. P3 — `gen_step_token_bridges.py` должен это заменить. | Да — P3 |
+| `complex_token_rules` | **Межпроектная логика**: pay-семантика (internal/external) специфична для платёжного домена | Нет — структура pay flow зависит от домена |
+| `qwen_service_mappings` | **Не смогли**: маппинг Qwen StepParams полей (`food_train`, `food_station`) → StepInfo. Имена полей в StepParams зафиксированы в `qwen_encoder.py` и меняются редко. | Можно derive из StepParams dataclass через introspection |
+| `safe_keyword_step_types` | **Межпроектная логика**: для каких step_type Qwen keywords не вредят BM25. Требует эмпирической проверки. | Нет — зависит от распределения score по типам |
+| `tag_stop_base` | **Generic NLP**: английские слова-мусор в Qwen-тегах (management, service, data...). Не зависят от проекта. | Частично — через TF-IDF по тегам всех сервисов |
+| `infra_module_tokens` | **Межпроектная логика**: инфра-сервисы (auth, gateway, delivery) не должны попадать в optional groups. Список зависит от naming conventions. | Можно derive из `tier4_remote_tokens` + известных arch ролей |
+| `step_train_patterns` | Оставлен для документации, не используется в step_typer после 0a7f80f. oracle.py использует `oracle_train_patterns`. | — |
+| `oracle_train_patterns` | **Межпроектная логика**: D-train vs G-train для oracle — ЖД-специфика | Нет |
+| `security_filter`, `tier4_executes_tokens` | **Фреймворк-специфика**: Spring Security / OncePerRequestFilter. Для другого фреймворка — другие маркеры. | Нет — зависит от фреймворка |
+| `arch_suffix_stop`, `arch_token_extra`, `auth_token_whitelist`, `auth_namespace_noise` | **Частично фреймворк-специфика** (Spring Boot naming), частично generic | Частично — через freq analysis суффиксов |
